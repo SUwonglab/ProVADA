@@ -1,42 +1,60 @@
 # provada/paths.py
 
 from pathlib import Path
-import os
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+# --- Core Project Directories ---
 
-SRC_ROOT = PROJECT_ROOT / "provada"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Paths to data, models, logs, etc.
-DATA_DIR   = PROJECT_ROOT / "data"
-MODELS_DIR = PROJECT_ROOT / "models"
-LOGS_DIR   = Path(os.getenv("MYAPP_LOG_DIR", PROJECT_ROOT / "logs"))
+# PACKAGE_ROOT is the root of the installable provada package (e.g., /path/to/package_dir/provada/)
+PACKAGE_ROOT = REPO_ROOT / "provada"
 
-# helper to build any other path
+# --- Paths for Internal Helper Scripts ---
+UTILS_DIR = PACKAGE_ROOT / "utils"
+
+# Path to the script that parses PDBs
+PARSE_CHAINS_SCRIPT = UTILS_DIR / "pdb_to_mpnn_jsonl.py"
+
+# Path to the script that creates the fixed positions dictionary
+MAKE_FIXED_POS_SCRIPT = UTILS_DIR / "define_design_constraints.py"
+
+
+# --- Path to External Dependencies ---
+
+# !! IMPORTANT !!
+# The user MUST update this path to point to their local installation
+# of the main ProteinMPNN script. ProVADA will not work without it.
+# This should be an ABSOLUTE path.
+#
+# EXAMPLE:
+# MPNN_SCRIPT = Path("/home/user/apps/ProteinMPNN/protein_mpnn_run.py")
+#
+MPNN_SCRIPT = None # Set to None to force an error if not configured by the user.
+
+
+# --- Helper Function for Validation ---
+
+def get_mpnn_script_path():
+    """
+    Validates and returns the path to the ProteinMPNN script.
+    Raises a FileNotFoundError if the path is not configured or invalid.
+    """
+    if MPNN_SCRIPT is None or not MPNN_SCRIPT.is_file():
+        raise FileNotFoundError(
+            "The path to 'protein_mpnn_run.py' is not configured or is invalid.\n"
+            "Please edit the MPNN_SCRIPT variable in 'provada/paths.py' to point to your local installation."
+        )
+    return MPNN_SCRIPT
+
+
+# Helper to build any other path relative to the repository root.
 def resource_path(*relative_parts: str) -> Path:
     """
-    Return PROJECT_ROOT / <relative_parts...>, e.g.
+    Builds an absolute path starting from the top-level project directory (REPO_ROOT).
+
+    Example:
+      # Assuming REPO_ROOT is /path/to/packagedir/, this returns:
+      # /path/to/packagedir/configs/foo.yml
       resource_path("configs", "foo.yml")
     """
-    return PROJECT_ROOT.joinpath(*relative_parts)
-
-
-# Paths for helper-script paths
-
-# This file contains the path to the script that parse the chains
-PARSE_CHAINS_SCRIPT = Path(
-    PROJECT_ROOT / "parse_multiple_chains.py"
-)
-
-# This file contains the path to the script that makes fixed positions
-MAKE_FIXED_POS_SCRIPT = Path(
-    PROJECT_ROOT / "make_fixed_positions_dict.py"
-)
-
-# This file contains the path to the MPNN script
-MPNN_SCRIPT = Path(
-    PROJECT_ROOT / "protein_mpnn_run.py"
-)
-
-
-
+    return REPO_ROOT.joinpath(*relative_parts)

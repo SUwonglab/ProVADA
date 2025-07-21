@@ -26,6 +26,62 @@ The fitness score combines multiple objectives. A key component is a lightweight
 <img src="./assets/classifier_schematics.png" alt="Classifier Architecture" width="650"/>
 
 
+
+## Installation
+
+### 1. Prerequisites
+
+Before installing, please ensure your system meets the following requirements:
+
+*   **Python 3.11+**: This package requires Python version 3.11 or newer. You can verify your version by running:
+    ```bash
+    python3 --version
+    ```
+    Make sure that the `python3` command used to create the virtual environment in the next step points to a compatible version.
+
+*   **ProteinMPNN**: This package relies on a local installation of ProteinMPNN for structure-based sequence design. Please follow the official [ProteinMPNN installation guide](https://github.com/dauparas/ProteinMPNN) to set it up first.
+
+    **Crucially**, after installing ProteinMPNN, you must **update the `MPNN_SCRIPT` path in `provada/paths.py`** to point to your local `protein_mpnn_run.py` script.
+
+### 2. Package Installation
+
+We strongly recommend installing ProVADA in a clean, dedicated virtual environment.
+
+The following commands will clone the repository, set up a virtual environment, and install the `provada` package with all its required Python libraries.
+
+```bash
+# 1. Clone this repository from GitHub
+git clone https://github.com/SUwonglab/provada.git
+cd provada
+
+# 2. Create and activate a virtual environment using a compatible Python version
+#    (The following commands create a 'venv' folder in your project directory)
+
+# On macOS / Linux:
+python3 -m venv venv
+source venv/bin/activate
+
+# On Windows:
+# python -m venv venv
+# venv\Scripts\activate
+
+# 3. Install the provada package and its dependencies
+#    This command reads the pyproject.toml file and installs everything needed.
+pip install .
+```
+
+
+
+
+## Usage
+
+### A Note on Using Your Own Proteins
+
+The ProVADA workflow relies on two key utility scripts to prepare PDB structures for ProteinMPNN: `provada/utils/pdb_to_mpnn_jsonl.py` and `provada/utils/define_design_constraints.py`.
+
+These scripts are designed to be general-purpose. However, due to the high variability in PDB file formatting (e.g., non-standard residue names, HETATMs, complex chain IDs), they **may need to be modified** to work correctly with your specific protein structures.
+
+
 ## Citation
 
 If you use ProVADA in your research, please cite our manuscript:
