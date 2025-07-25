@@ -29,51 +29,53 @@ The fitness score combines multiple objectives. A key component is a lightweight
 
 ## Installation
 
-### 1. Prerequisites
+Follow the instructions below to install ProVADA.
 
-Before installing, please ensure your system meets the following requirements:
-
-*   **Python 3.11+**: This package requires Python version 3.11 or newer. You can verify your version by running:
-    ```bash
-    python3 --version
-    ```
-    Make sure that the `python3` command used to create the virtual environment in the next step points to a compatible version.
-
-*   **ProteinMPNN**: This package relies on a local installation of ProteinMPNN for structure-based sequence design. Please follow the official [ProteinMPNN installation guide](https://github.com/dauparas/ProteinMPNN) to set it up first.
-
-    **Crucially**, after installing ProteinMPNN, you must **update the `MPNN_SCRIPT` path in `provada/paths.py`** to point to your local `protein_mpnn_run.py` script.
-
-### 2. Package Installation
-
-We strongly recommend installing ProVADA in a clean, dedicated virtual environment.
-
-The following commands will clone the repository, set up a virtual environment, and install the `provada` package with all its required Python libraries.
-
+### 1. Clone the repository
 ```bash
 # 1. Clone this repository from GitHub
 git clone https://github.com/SUwonglab/provada.git
 cd provada
+```
 
-# 2. Create and activate a virtual environment using a compatible Python version
-#    (The following commands create a 'venv' folder in your project directory)
+### 2. Create and activate a virtual environment
+```bash
+conda create -n provada-env python=3.11 -y
+conda activate provada-env
+pip install uv
+uv pip install .
+```
 
-# On macOS / Linux:
-python3 -m venv venv
-source venv/bin/activate
 
-# On Windows:
-# python -m venv venv
-# venv\Scripts\activate
+### 3. ProteinMPNN Set up
+ProVADA uses ProteinMPNN as a local dependency for structure-based sequence design.
+Run the command below to populate the ProteinMPNN submodule with the required source code.
 
-# 3. Install the provada package and its dependencies
-#    This command reads the pyproject.toml file and installs everything needed.
-pip install .
+```bash
+git submodule update --init --recursive
 ```
 
 
 
-
 ## Usage
+
+We provide an example script to run ProVADA on the example Renin protein described in the manuscript.
+
+```bash
+python run_provada.py \
+    --input_pdb_path 'inputs/renin/renin_af3.pdb' \
+    --input_sequence_path 'inputs/renin/example_seq_renin.txt' \
+    --classifier_weights 'inputs/renin/logreg_model_weights.pkl' \
+    --fixed_positions_files 'inputs/renin/interface_positions.txt' 'inputs/renin/conserved_positions.txt' \
+    --force_design_residues 'C' \
+    --output_dir './results/test_hard_fix' \
+    --trajectory_file 'test_fix_300iter_2.csv' \
+    --save_trajectory \
+    --greedy
+```
+
+### Example
+
 
 ### A Note on Using Your Own Proteins
 
