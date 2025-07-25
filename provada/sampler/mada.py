@@ -15,7 +15,7 @@ from provada.utils import (
 )
 from provada.base_sequence_info import BaseSequenceInfo
 from provada.sampler import SamplerParams, SamplerResult, TopProteinTracker
-
+from provada.utils.log import get_logger, setup_logger
 
 
 # -------------------------------
@@ -38,8 +38,9 @@ def resample_population_stochastic(seqs, scores, top_k_frac, temp, prev_temp) ->
         elite_indices (np.ndarray): the K indices picked as elites
         counts (dict): mapping elite_index -> how many copies in new population
     """
+    logger = get_logger(__name__)
     N = len(seqs)
-    
+
     scores = np.asarray(scores, dtype=float)
     # Annealed log‐weights
     if prev_temp is np.inf:
@@ -63,10 +64,9 @@ def resample_population_stochastic(seqs, scores, top_k_frac, temp, prev_temp) ->
     counts = dict(Counter(elite_idx))
 
     elite_scores = scores[elite_idx]
-    print("Elite indices:", elite_idx)
+    logger.info(f"Elite indices: {elite_idx}")
 
     return elite_idx, elite_scores, counts
-
 
 
 def resample_population_greedy(seqs, scores, top_k_frac, temp, prev_temp) -> tuple:
@@ -112,8 +112,6 @@ def resample_population_greedy(seqs, scores, top_k_frac, temp, prev_temp) -> tup
     counts = dict(Counter(resampled_idx))
 
     return resampled_idx, resampled_scores, counts
-
-
 
 
 # -------------------------------
@@ -217,7 +215,7 @@ def mh_step(proposal_seqs: np.ndarray,
         new_score = proposal_scores[i]
 
         if verbose:
-            print("new score: %.3f, orig score: %.3f" % (new_score, orig_score))
+            print(f"new score: {new_score}, orig score: {orig_score}")
         
         mh_ratio = np.exp((new_score - orig_score) / temperature)
         
@@ -299,12 +297,15 @@ def MADA(
     """
     Perform population-based sampling with iterative mutation, evaluation, and selection.
     """
+    logger = get_logger(__name__)
+
+    logger.debug(f"Starting MADA with {num_iter} iterations")
 
     assert num_iter >= 2, "Number of iterations must >= 2"
     seq_len = len(sequence)
     init_mask_frac = sampler_params.init_mask_frac
     min_mask_frac = sampler_params.min_mask_frac
-    
+
     top_k_frac = sampler_params.top_k_frac
     alpha = sampler_params.alpha
 
@@ -315,7 +316,6 @@ def MADA(
     )
     T_schedule = np.concatenate(([np.inf], T_schedule))  
 
-    
     # Anneal the mismatch penalty
     if sampler_params.anneal_mismatch_penalty:
         mismatch_penalty_schedule = (
@@ -330,16 +330,17 @@ def MADA(
         mismatch_penalty_schedule = np.ones(num_iter) * sampler_params.mismatch_penalty
 
     sampler_params.mismatch_penalty_schedule = mismatch_penalty_schedule
-    print(f"Mismatch penalty schedule: {mismatch_penalty_schedule}")
-    print(f"Temperature schedule: {T_schedule}")
+    if verbose:
+        print(f"Mismatch penalty schedule: {mismatch_penalty_schedule}")
+        print(f"Temperature schedule: {T_schedule}")
 
     masking_frac_schedule = make_mask_schedule(num_iter, 
                                                init_mask_frac, 
                                                min_mask_frac, 
                                                alpha=alpha)
-    print(f"Masking fraction schedule: {masking_frac_schedule}")
-    
-    
+    if verbose:
+        print(f"Masking fraction schedule: {masking_frac_schedule}")
+
     # Initialize the population with copies of the initial sequence
     population = [np.asarray(arr_to_aa(sequence)) for _ in range(num_seqs)]
     tracker = TopProteinTracker(max_size=num_seqs)
@@ -375,7 +376,7 @@ def MADA(
         proposal_scores = []
         hard_fixed_positions = base_protein_info.hard_fixed_positions
 
-         # mask & fill each chain
+        # mask & fill each chain
         if t == 0:
             # For the first iteration, we use the initial sequence
             masked_seq = generate_masked_seq_arr(
@@ -422,7 +423,7 @@ def MADA(
 
             frac_mismatches = get_mismatch_fraction_multiseqs(seqs = proposals, 
                                                               ref_seq= sequence)
-        
+
             # logging
             for i in range(len(proposals)):
                 row = {
@@ -445,7 +446,6 @@ def MADA(
                         line=row
                     )
 
-
         if t > 0:
             for idx, idx_num_seq in counts.items():
                 # idx : index of the chain to fill
@@ -456,7 +456,7 @@ def MADA(
                 masked_seq = generate_masked_seq_arr(num_fixed_positions = max(1, (1 - mask_frac) * (seq_len - len(hard_fixed_positions))),
                                                      input_seq = arr_to_aa(cur_seq),
                                                      hard_fixed_positions = hard_fixed_positions)  
-                
+
                 # Call MPNN once to fill the initial sequence x with population size
                 mpnn_output = fill_mpnn(
                     masked_seq,
@@ -505,7 +505,7 @@ def MADA(
 
                 frac_mismatches = get_mismatch_fraction_multiseqs(seqs = cur_proposals, 
                                                                   ref_seq= sequence)
-            
+
                 # logging
                 for i in range(len(cur_proposals)):
                     row = {
@@ -531,8 +531,8 @@ def MADA(
 
                 proposals.extend(cur_proposals)
                 proposal_scores.extend(cur_proposal_scores)
-                
-        # Update 
+
+        # Update
         population = proposals
         scores = proposal_scores
 
@@ -552,16 +552,16 @@ def MADA(
         else:
             # last step: rejection sampling
             # population, scores = rejection_sampler(
-            #     population, 
+            #     population,
             #     scores,
             #     top_k_frac=1.0
             # )
             pass
-        
-        print("Iteration %d, best score: %.3f" % (t, max(scores)))
+
+        logger.debug("Iteration %d, best score: %.3f" % (t, max(scores)))
         best_prob = max(tracker.get_all_scores(f"prob_{base_protein_info.target_label}"))
-        print("Iteration %d, best probability: %.3f" % (t, best_prob))
-        print("[Fraction of mismatches] Iteration %d, avg fraction of mismatches: %.3f" % (t, np.mean(frac_mismatches)))
+        logger.debug("Iteration %d, best probability: %.3f" % (t, best_prob))
+        logger.debug("[Fraction of mismatches] Iteration %d, avg fraction of mismatches: %.3f" % (t, np.mean(frac_mismatches)))
 
     # Finalize results, outputting the top k sequences and scores
     final_sequences, final_fitness, final_mpnn_scores, final_cls_probs, final_perps = [], [], [], [], []

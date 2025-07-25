@@ -6,7 +6,10 @@ from typing import List, Dict, Any
 import numpy as np
 from pathlib import Path
 from typing import Union
-
+from provada.utils.sequences.pairwise_metrics import (
+    sequence_similarity,
+    sequence_identity,
+)
 
 AA_LIST = ['A','C','D','E','F','G','H','I','K','L','M','N','P','Q','R','S','T','V','W','Y', '_']  # '_' is used for masking positions
 
@@ -43,7 +46,7 @@ def aa_to_arr(seq: str, default_to_A = True) -> np.ndarray:
         return seq
     if not isinstance(seq, str):
         raise ValueError("Input must be a string")
-    
+
     aa2idx = {aa: idx for idx, aa in enumerate(AA_LIST)}
     arr = []
     for aa in seq:
@@ -56,9 +59,8 @@ def aa_to_arr(seq: str, default_to_A = True) -> np.ndarray:
                 arr.append(aa2idx['A'])
             else:
                 raise ValueError(f"Invalid character '{aa}' in sequence.")
-            
-    return np.array(arr, dtype=int)
 
+    return np.array(arr, dtype=int)
 
 
 def arr_to_aa(arr):
@@ -84,7 +86,6 @@ def parse_masked_seq(masked_seq_str: str) -> list:
     return masked
 
 
-
 def masked_seq_arr_to_str(masked_seq: np.ndarray) -> str:
     """
     Convert a masked sequence array (1D numpy array) to a string.
@@ -94,7 +95,6 @@ def masked_seq_arr_to_str(masked_seq: np.ndarray) -> str:
     if not isinstance(masked_seq, np.ndarray):
         raise ValueError("Input must be a numpy array")
     return ''.join([AA_LIST[i] if i>= 0 else '_' for i in masked_seq])
-
 
 
 def generate_masked_seq_str(
@@ -144,14 +144,13 @@ def generate_masked_seqs_str(
 
     if not isinstance(input_seqs, list) or not all(isinstance(seq, str) for seq in input_seqs):
         raise ValueError("input_seqs must be a list of strings")
-    
+
     masked_seqs = []
     for seq in input_seqs:
         masked_seq_str = generate_masked_seq_str(seq, num_fixed_positions, hard_fixed_positions)
         masked_seqs.append(masked_seq_str)
-    
-    return masked_seqs
 
+    return masked_seqs
 
 
 def generate_masked_seq_arr(
@@ -164,11 +163,10 @@ def generate_masked_seq_arr(
     and return it as a numpy array.
     """
     masked_seq_str = generate_masked_seq_str(input_seq, num_fixed_positions, hard_fixed_positions)
-    
+
     # Convert the masked sequence string to a numpy array
     masked_seq_arr = aa_to_arr(masked_seq_str)
     return masked_seq_arr
-
 
 
 def get_masked_positions(masked_seq_str: str) -> List[int]:
@@ -178,13 +176,15 @@ def get_masked_positions(masked_seq_str: str) -> List[int]:
     return [i for i, c in enumerate(masked_seq_str) if c == '_']
 
 
-
-def compute_diversity_metrics_str(seqs: List[str]) -> Dict[str, Any]:
+def compute_diversity_metrics(
+    seqs: Union[List[str], np.ndarray], distance: str = "hamming"
+) -> Dict[str, Any]:
     """
-    Given a list of equal-length sequences, compute:
-      1) var_flags: a list of 0/1 per column (1 if at least one seq differs at that position)
-      2) pairwise Hamming distances between all unordered pairs
-      3) summary metrics: avg_dist, min_dist, max_dist
+    Compute diversity metrics for a set of sequences.
+
+    Accepts:
+        - List[str]: list of equal-length strings
+        - np.ndarray: 2D array of shape (N, L), dtype=int or str
 
     Returns a dict:
       {
@@ -195,92 +195,39 @@ def compute_diversity_metrics_str(seqs: List[str]) -> Dict[str, Any]:
         "max_dist": int
       }
     """
-    if not seqs:
-        raise ValueError("`seqs` must contain at least one sequence.")
-    L = len(seqs[0])
-    if any(len(s) != L for s in seqs):
-        raise ValueError("All sequences must have the same length.")
-
-    # Per-position variability
-    var_flags = [
-        1 if len(set(col)) > 1 else 0
-        for col in zip(*seqs)
-    ]
-
-    # Pairwise Hamming
-    def hamming(a: str, b: str) -> int:
-        return sum(x != y for x, y in zip(a, b))
-
-    pairs = combinations(seqs, 2)
-    distances = [hamming(a, b) for a, b in pairs]
-
-    if distances:
-        avg_dist = sum(distances) / len(distances)
-        min_dist = min(distances)
-        max_dist = max(distances)
+    if isinstance(seqs, list):
+        # Validate and convert List[str] to np.ndarray
+        if not seqs:
+            raise ValueError("`seqs` must contain at least one sequence.")
+        L = len(seqs[0])
+        if any(len(s) != L for s in seqs):
+            raise ValueError("All sequences must have the same length.")
+        seq_array = np.array([list(s) for s in seqs], dtype="<U1")
+    elif isinstance(seqs, np.ndarray):
+        if seqs.ndim != 2:
+            raise ValueError(f"`seqs` must be 2D, got shape {seqs.shape}")
+        seq_array = seqs
     else:
-        # Only one sequence, no pairs
-        avg_dist = min_dist = max_dist = 0
+        raise TypeError("`seqs` must be either List[str] or np.ndarray")
 
-    return {
-        "var_flags": var_flags,
-        "distances": distances,
-        "avg_dist": avg_dist,
-        "min_dist": min_dist,
-        "max_dist": max_dist,
-    }
-
-
-
-
-def compute_diversity_metrics_int(
-    seq_array: np.ndarray
-) -> Dict[str, Any]:
-    """
-    Given a 2D numpy array of shape (N, L), where each row is a sequence
-    (either dtype=int or dtype='<U1'), compute:
-
-      1) var_flags: List[int] of length L, where 1 indicates at least one
-         difference in that column across rows.
-      2) pairwise Hamming distances for all unordered row-pairs.
-      3) summary metrics: avg_dist, min_dist, max_dist.
-
-    Returns:
-      {
-        "var_flags": List[int],
-        "distances": List[int],
-        "avg_dist": float,
-        "min_dist": int,
-        "max_dist": int
-      }
-    """
-    # 0) basic validation
-    if seq_array.ndim != 2:
-        raise ValueError(f"`seq_array` must be 2D, got shape {seq_array.shape}")
     N, L = seq_array.shape
 
-    # 1) per-column variability flags
-    var_flags = []
-    for col_idx in range(L):
-        column = seq_array[:, col_idx]
-        # np.unique works for both ints and one-char strings
-        uniq = np.unique(column)
-        var_flags.append(1 if uniq.size > 1 else 0)
+    # 1) Per-column variability
+    var_flags = [
+        1 if np.unique(seq_array[:, col_idx]).size > 1 else 0 for col_idx in range(L)
+    ]
 
-    # 2) pairwise Hamming distances
-    distances = []
-    for i, j in combinations(range(N), 2):
-        # boolean array where entries differ, sum → Hamming distance
-        dist = int(np.sum(seq_array[i] != seq_array[j]))
-        distances.append(dist)
+    # 2) Pairwise Hamming distances
+    distances = [
+        int(np.sum(seq_array[i] != seq_array[j])) for i, j in combinations(range(N), 2)
+    ]
 
-    # 3) summary metrics
+    # 3) Summary stats
     if distances:
         avg_dist = sum(distances) / len(distances)
         min_dist = min(distances)
         max_dist = max(distances)
     else:
-        # only one sequence → trivially zero diversity
         avg_dist = min_dist = max_dist = 0
 
     return {
@@ -290,8 +237,6 @@ def compute_diversity_metrics_int(
         "min_dist": min_dist,
         "max_dist": max_dist,
     }
-
-
 
 
 def mask_seq_str_to_arr(masked_seq_str):
@@ -313,9 +258,6 @@ def mask_seq_str_to_arr(masked_seq_str):
     return np.array(int_seq)
 
 
-
-
-
 def append_csv_line(
     path: Path,
     line: Dict[str, Any]
@@ -334,25 +276,31 @@ def append_csv_line(
         df.to_csv(path, mode="w", header=True, index=False)
 
 
+def get_mismatch_fraction_multiseqs(
+    seqs: Union[List[str], np.ndarray], ref_seq: str, use_similarity: bool = True
+) -> List[float]:
+    """
+    Compute the mismatch fraction for a list of sequences with respect to a
+    reference sequence. If use_similarity is True, we use the sequence_similarity
+    (based on a substitution matrix) to compute the mismatch fraction.
 
-def get_mismatch_fraction_multiseqs(seqs: Union[List[str], np.ndarray], 
-                                    ref_seq: Union[str, np.ndarray]) -> List[float]:
+    Args:
+        seqs (List[str]): List of sequences to compute the mismatch fraction for.
+        ref_seq (str): Reference sequence to compute the mismatch fraction with respect to.
+        use_similarity (bool): If True, use the sequence_similarity to compute the mismatch fraction.
 
-    mismatch_fracs = []
-    for seq in seqs:
-        if len(seq) != len(ref_seq):
-            raise ValueError("All sequences must have the same length as the reference sequence.")
+    Returns:
+        List[float]: List of mismatch fractions.
+    """
 
-        # convert sequences to numpy arrays if they are strings
-        if isinstance(seq, str):
-            seq = aa_to_arr(seq)
-        if isinstance(ref_seq, str):
-            ref_seq_arr = aa_to_arr(ref_seq)
-        mismatch_frac = int(np.sum(seq != ref_seq_arr)) / len(ref_seq_arr)
-        mismatch_fracs.append(mismatch_frac)
+    comparison_function = sequence_similarity if use_similarity else sequence_identity
+
+    # Create dataframe containing the sequences
+    mismatch_fracs = [
+        1 - comparison_function(arr_to_aa(arr_seq), ref_seq) for arr_seq in seqs
+    ]
 
     return mismatch_fracs
-
 
 
 def read_fixed_positions(position_txt):
@@ -368,22 +316,3 @@ def read_fixed_positions(position_txt):
         positions = [int(line.strip()) for line in f if line.strip().isdigit()]
     
     return positions
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

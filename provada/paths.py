@@ -2,9 +2,12 @@
 
 from pathlib import Path
 
-# --- Core Project Directories ---
 
+# --- Core Project Directories ---
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# --- Path to ProteinMPNN run script ---
+MPNN_SCRIPT = REPO_ROOT / "ProteinMPNN/protein_mpnn_run.py"
 
 # PACKAGE_ROOT is the root of the installable provada package (e.g., /path/to/package_dir/provada/)
 PACKAGE_ROOT = REPO_ROOT / "provada"
@@ -17,20 +20,6 @@ PARSE_CHAINS_SCRIPT = UTILS_DIR / "pdb_to_mpnn_jsonl.py"
 
 # Path to the script that creates the fixed positions dictionary
 MAKE_FIXED_POS_SCRIPT = UTILS_DIR / "define_design_constraints.py"
-
-
-# --- Path to External Dependencies ---
-
-# !! IMPORTANT !!
-# The user MUST update this path to point to their local installation
-# of the main ProteinMPNN script. ProVADA will not work without it.
-# This should be an ABSOLUTE path.
-#
-# EXAMPLE:
-# MPNN_SCRIPT = Path("/home/user/apps/ProteinMPNN/protein_mpnn_run.py")
-#
-MPNN_SCRIPT = None # Set to None to force an error if not configured by the user.
-
 
 # --- Helper Function for Validation ---
 
