@@ -120,8 +120,7 @@ def main(args):
         trajectory_path=args.output_dir,
         trajectory_file=args.trajectory_file,
     )
-    logger.debug("MADA run completed.")
-    logger.debug(f"Final results dataframe shape: {results.shape}")
+    logger.info("MADA run completed.")
     logger.debug(f"Results saved in {args.output_dir}")
 
 
