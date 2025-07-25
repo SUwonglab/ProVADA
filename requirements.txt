@@ -1,0 +1,12 @@
+numpy~=2.2.5
+torch~=2.7.0
+transformers==4.51.3
+pandas~=2.2.3
+pytest
+py3Dmol
+scikit-learn
+coloredlogs
+biotite
+levenshtein
+ipython
+omegaconf

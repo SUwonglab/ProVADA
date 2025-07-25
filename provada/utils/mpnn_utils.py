@@ -15,6 +15,8 @@ from provada.utils.helpers import (
     masked_seq_arr_to_str,
 )
 
+from provada.utils.log import setup_logger, get_logger
+
 from provada.paths import (
     PARSE_CHAINS_SCRIPT,
     MAKE_FIXED_POS_SCRIPT,
@@ -64,8 +66,6 @@ def run_mpnn(
     return score_val
 
 
-
-
 def get_mpnn_scores(
     pdb: str,
     protein_chain: str = "",
@@ -103,8 +103,6 @@ def get_mpnn_scores(
     return score
 
 
-
-
 def mpnn_masked_gen(
     masked_seq_str: str,
     pdb_path: Union[str, Path],
@@ -125,7 +123,7 @@ def mpnn_masked_gen(
       num_seqs_gen:    number of sequences to generate (incl. baseline).
       tmp_root:        base dir for temp work dirs (defaults to ./tmp_).
       keep_tmp:        if True, do not delete the work dir.
-      verbose:         if True, print progress messages.
+      verbose:         if True, output progress messages.
 
     Returns:
       (filled_seqs,
@@ -134,6 +132,9 @@ def mpnn_masked_gen(
        old_global_score,
        old_local_score)
     """
+
+    logger = get_logger(__name__)
+
     pdb_path = Path(pdb_path)
     # Parse masked string → list of AAs + '_'s
     masked_arr = parse_masked_seq(masked_seq_str)
@@ -142,8 +143,7 @@ def mpnn_masked_gen(
     base_tmp = Path(tmp_root or "./tmp_")
     base_tmp.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(dir=base_tmp))
-    if verbose:
-        print(f"[mpnn_gen] work dir → {work_dir}")
+    logger.debug(f"[mpnn_gen] work dir → {work_dir}")
 
     # Generate parsed.jsonl from PDB
     parsed_jsonl = work_dir / "parsed.jsonl"
@@ -245,9 +245,10 @@ def mpnn_masked_gen(
 
     # Cleanup
     if not keep_tmp:
+        logger.debug(f"[mpnn_gen] deleting work dir at {work_dir}")
         shutil.rmtree(work_dir)
-    elif verbose:
-        print(f"[mpnn_gen] retained work dir at {work_dir}")
+    else:
+        logger.debug(f"[mpnn_gen] retained work dir at {work_dir}")
 
     # Organize outputs
     baseline = results[0]
@@ -265,8 +266,6 @@ def mpnn_masked_gen(
         'old_global_score': old_global_score,
         'old_local_score': old_local_score
     }
-
-
 
 
 def fill_mpnn(

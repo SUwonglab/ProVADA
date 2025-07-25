@@ -4,12 +4,12 @@
 provada: core utilities for the ProVADA package.
 """
 
+# Import submodules
+
 # Filesystem paths
 from .paths import PARSE_CHAINS_SCRIPT, MAKE_FIXED_POS_SCRIPT, MPNN_SCRIPT
 
-# Import submodules
-
-# util functions 
+# util functions
 from . import utils
 # base sequence info
 from .base_sequence_info import BaseSequenceInfo
