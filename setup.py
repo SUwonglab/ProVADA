@@ -24,7 +24,7 @@ except FileNotFoundError:
 setuptools.setup(
     # --- Project Metadata ---
     name="provada",
-    version="1.1.0",
+    version="2.0.0",
     author="Sophia Lu, Ben Viggiano, Xiaowei Zhang",
     author_email="sophialu@stanford.edu, viggiano@stanford.edu, zhangxw@stanford.edu",
     description="Official implementation of the ProVADA package for conditional protein variant design.",
