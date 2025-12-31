@@ -1,0 +1,28 @@
+name: Lint Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+jobs:
+  flake8-lint:
+    name: Run Flake8 Lint
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.12"  # or whichever version you use
+
+    - name: Install Flake8 and plugins
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 flake8-bugbear flake8-comprehensions flake8-builtins
+
+    - name: Run Flake8
+      run: flake8 .

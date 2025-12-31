@@ -1,0 +1,30 @@
+numpy
+torch
+transformers
+pandas
+pytest
+py3Dmol
+scikit-learn
+coloredlogs
+biotite
+levenshtein
+ipython
+omegaconf
+attrs
+biopython
+rich
+esm @ git+https://github.com/bviggiano/esm.git@fix/178
+freesasa
+pyrosetta-installer
+seaborn
+matplotlib
+wandb
+accelerate
+pandarallel
+datasets
+gemmi
+jupyter
+ipykernel
+protein_mpnn @ git+https://github.com/bviggiano/ProteinMPNN.git@override_pdb_dict_list
+flake8
+pillow

@@ -1,0 +1,18 @@
+# mock_config.yaml
+dataset:
+  dataset_name: gfp # Name of the dataset to load in
+
+attributes:
+  list:
+    - attr1
+    - attr2
+    - attr3
+  str: "value"
+  int: 1
+  float: 1.0
+  bool: true
+  none: null
+  dict:
+    attr1: value1
+    attr2: value2
+    attr3: value3
