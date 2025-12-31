@@ -528,6 +528,82 @@ class LocalizationPredictor(Evaluator):
         return pd.DataFrame({"sequence": sequences, "localization_prob": predictions[:, 1]})
 
 
+@EVALUATOR_REGISTRY.register("discounted_hamming_distance")
+class DiscountedHammingDistance(Evaluator):
+    """
+    Returns discounted hamming distance to reference sequence (normalized by sequence length)
+    and multiply by localization probability.
+
+    NOTE: This is an example of how we recommend combining evalutors into a
+    single evaluator.
+    """
+
+    @classmethod
+    def available_scores(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "discounted_hamming_distance": {
+                "larger_is_better": False,
+                "min_value": 0,
+                "max_value": 1,
+            }
+        }
+
+    def __init__(
+        self,
+        seed: int = 42,
+        active_scores: List[str] = None,
+        use_cache: bool = True,
+    ):
+        super().__init__(seed=seed, active_scores=active_scores, use_cache=use_cache)
+
+        self.localization_evaluator = get_evaluator(
+            "localization_predictor", seed=seed, use_cache=use_cache
+        )
+        self.normalized_hamming_distance_evaluator = get_evaluator(
+            "sequence_similarity",
+            seed=seed,
+            active_scores=["normalized_hamming_distance"],
+            use_cache=use_cache,
+        )
+
+    def get_extra_kwargs(self, base_variant):
+        """
+        DiscountedHammingDistance requires a reference sequence for comparison.
+        """
+        return {"reference_sequence_or_sequences": base_variant.sequence}
+
+    def evaluate_sequences(
+        self,
+        sequences: List[str],
+        reference_sequence_or_sequences: Union[str, List[str]],
+        **kwargs,
+    ) -> pd.DataFrame:
+
+        # Get localization predictions
+        localization_probabilities = self.localization_evaluator.evaluate_sequences(sequences)[
+            "localization_prob"
+        ].values
+
+        normalized_hamming_distances = (
+            self.normalized_hamming_distance_evaluator.evaluate_sequences(
+                sequences=sequences,
+                reference_sequence_or_sequences=reference_sequence_or_sequences,
+            )["normalized_hamming_distance"].values
+        )
+
+        # Combine
+        discounted_hamming_distances = (
+            normalized_hamming_distances * localization_probabilities
+        )
+
+        return pd.DataFrame(
+            {
+                "sequence": sequences,
+                "discounted_hamming_distance": discounted_hamming_distances,
+            }
+        )
+
+
 @EVALUATOR_REGISTRY.register("structure")
 class StructureMetrics(Evaluator):
     """
