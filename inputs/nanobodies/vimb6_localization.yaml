@@ -1,0 +1,53 @@
+# Nanobody Internalization Config File
+seed: 42
+no_wandb: true
+wandb_project: provada_vimb6_localization
+
+base_variant:
+  sequence_file_path: inputs/nanobodies/vimb6_seq.txt
+  fixed_position_files:
+    - inputs/nanobodies/vimb6_cdr_positions.txt
+  structure_file_path: inputs/nanobodies/vimb6.pdb
+
+reference_distribution_file: inputs/nanobodies/reference_distribution.csv
+
+sampler:
+  sampler_type: mada_topk_is
+  num_iters: 100
+  population_size: 50
+  top_k_fraction: 0.2
+  score_weights:
+    localization_prob: 1
+    sequence_similarity: 0
+    normalized_hamming_distance: 0
+    discounted_hamming_distance: 0.5
+
+
+generator:
+  generator_type: soluble_mpnn
+  generation_kwargs:
+    generations_per_sequence: 1
+    temperature: 0.2
+    omit_AAs: "C"
+
+masking_strategy:
+  masking_strategy_type: gaussian_thompson
+  masking_strategy_kwargs:
+    alpha: 2.0
+    gamma: 0.95
+
+
+masking_schedule_config:
+  type: linear
+  kwargs:
+    start_value: 0.3
+    stop_value: 0.05
+
+temperature_schedule_config:
+  type: power
+  kwargs:
+    alpha: 2.0
+    start_value: 0.4
+    stop_value: 0.1
+
+
