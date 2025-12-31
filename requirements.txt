@@ -1,7 +1,7 @@
-numpy~=2.2.5
-torch~=2.7.0
-transformers==4.51.3
-pandas~=2.2.3
+numpy
+torch
+transformers
+pandas
 pytest
 py3Dmol
 scikit-learn
@@ -10,3 +10,21 @@ biotite
 levenshtein
 ipython
 omegaconf
+attrs
+biopython
+rich
+esm @ git+https://github.com/bviggiano/esm.git@fix/178
+freesasa
+pyrosetta-installer
+seaborn
+matplotlib
+wandb
+accelerate
+pandarallel
+datasets
+gemmi
+jupyter
+ipykernel
+protein_mpnn @ git+https://github.com/bviggiano/ProteinMPNN.git@override_pdb_dict_list
+flake8
+pillow

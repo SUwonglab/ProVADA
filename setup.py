@@ -1,6 +1,6 @@
 import setuptools
 
-#Use README.md for long description
+# Use README.md for long description
 try:
     with open("README.md", "r", encoding="utf-8") as fh:
         long_description = fh.read()
@@ -10,7 +10,12 @@ except FileNotFoundError:
 # Read dependencies from requirements.txt
 try:
     with open("requirements.txt", "r", encoding="utf-8") as f:
-        requirements = f.read().splitlines()
+        requirements = []
+        for line in f:
+            line = line.strip()
+            # Skip empty lines, comments, and pip flags (lines starting with -)
+            if line and not line.startswith("#") and not line.startswith("-"):
+                requirements.append(line)
 except FileNotFoundError:
     print("Warning: requirements.txt not found. Installing without dependencies.")
     requirements = []
@@ -19,14 +24,13 @@ except FileNotFoundError:
 setuptools.setup(
     # --- Project Metadata ---
     name="provada",
-    version="1.0.0",
+    version="2.0.0",
     author="Sophia Lu, Ben Viggiano, Xiaowei Zhang",
     author_email="sophialu@stanford.edu, viggiano@stanford.edu, zhangxw@stanford.edu",
     description="Official implementation of the ProVADA package for conditional protein variant design.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     license="MIT",
-    
     # --- Project URLs ---
     url="https://github.com/SUwonglab/provada",
     project_urls={
@@ -34,14 +38,11 @@ setuptools.setup(
         "Bug Tracker": "https://github.com/SUwonglab/provada/issues",
         "Publication": "https://www.biorxiv.org/content/10.1101/2025.07.11.664238v1",
     },
-
     # --- Build Configuration ---
     packages=["provada"],
-    
     # --- Dependencies ---
     python_requires=">=3.11",
-    install_requires=requirements,
-
+    install_requires=requirements,  # Read from requirements.txt
     # --- Classifiers for PyPI ---
     classifiers=[
         "Programming Language :: Python :: 3",

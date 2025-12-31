@@ -3,6 +3,14 @@
 **results
 **tmp_
 **logs
+**wandb
+*.csv
+*provada/components/locks
+*.vscode
+*.mov
+*.gif
+*.mp4
+analyze/output/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

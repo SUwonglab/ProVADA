@@ -1,39 +1,24 @@
-# provada/paths.py
+"""
+provada/paths.py
+
+Constants and helper functions related to paths in the project.
+"""
 
 from pathlib import Path
-
+import sys
 
 # --- Core Project Directories ---
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # --- Path to ProteinMPNN run script ---
-MPNN_SCRIPT = REPO_ROOT / "ProteinMPNN/protein_mpnn_run.py"
+PROTEIN_MPNN_DIR = REPO_ROOT / "ProteinMPNN"
+MPNN_SCRIPT = PROTEIN_MPNN_DIR / "protein_mpnn_run.py"
+PARSE_CHAINS_SCRIPT = PROTEIN_MPNN_DIR / "helper_scripts" / "parse_multiple_chains.py"
+MAKE_FIXED_POS_SCRIPT = (
+    PROTEIN_MPNN_DIR / "helper_scripts" / "make_fixed_positions_dict.py"
+)
 
-# PACKAGE_ROOT is the root of the installable provada package (e.g., /path/to/package_dir/provada/)
-PACKAGE_ROOT = REPO_ROOT / "provada"
-
-# --- Paths for Internal Helper Scripts ---
-UTILS_DIR = PACKAGE_ROOT / "utils"
-
-# Path to the script that parses PDBs
-PARSE_CHAINS_SCRIPT = UTILS_DIR / "pdb_to_mpnn_jsonl.py"
-
-# Path to the script that creates the fixed positions dictionary
-MAKE_FIXED_POS_SCRIPT = UTILS_DIR / "define_design_constraints.py"
-
-# --- Helper Function for Validation ---
-
-def get_mpnn_script_path():
-    """
-    Validates and returns the path to the ProteinMPNN script.
-    Raises a FileNotFoundError if the path is not configured or invalid.
-    """
-    if MPNN_SCRIPT is None or not MPNN_SCRIPT.is_file():
-        raise FileNotFoundError(
-            "The path to 'protein_mpnn_run.py' is not configured or is invalid.\n"
-            "Please edit the MPNN_SCRIPT variable in 'provada/paths.py' to point to your local installation."
-        )
-    return MPNN_SCRIPT
+PYTHON_PATH = sys.executable
 
 
 # Helper to build any other path relative to the repository root.

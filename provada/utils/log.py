@@ -12,6 +12,8 @@ import sys
 import threading
 import coloredlogs
 from IPython import get_ipython
+import shutil
+
 
 def is_running_in_notebook():
     """
@@ -32,6 +34,7 @@ def is_running_in_notebook():
 
     return False  # Probably standard Python interpreter
 
+
 _is_configured = False
 _lock = threading.Lock()
 
@@ -44,6 +47,7 @@ DATE_FORMAT = "%H-%M-%S"
 
 # Format of log messages in the console (used by coloredlogs)
 CONSOLE_FORMAT = "%(levelname)s: %(message)s"
+
 
 # This class is now only used if you are in a notebook
 class NotebookFormatter(logging.Formatter):
@@ -68,6 +72,7 @@ def setup_logger(
     verbose: bool = False,
     log_filename: Optional[str] = None,
     logging_subdir: Optional[str] = None,
+    suppress_console_logging: bool = False,
 ):
     """
     Configures the root logger for the codebase
@@ -89,7 +94,12 @@ def setup_logger(
         root_logger.handlers.clear()
 
     # Set the root logger level to DEBUG by default
-    root_logger.setLevel(logging.DEBUG)
+    console_level = (
+        logging.CRITICAL
+        if suppress_console_logging
+        else (logging.DEBUG if verbose else logging.INFO)
+    )
+    root_logger.setLevel(console_level)
 
     # --- Start of coloredlogs integration ---
 
@@ -97,14 +107,14 @@ def setup_logger(
     # Otherwise, install coloredlogs for a rich terminal experience.
     if is_running_in_notebook():
         ch = logging.StreamHandler(sys.stdout)
-        ch.setLevel(logging.DEBUG if verbose else logging.INFO)
+        ch.setLevel(console_level)
         ch.setFormatter(NotebookFormatter())
         ch.addFilter(CodebaseFilter())
         root_logger.addHandler(ch)
     else:
         # Install coloredlogs, which will handle the console logging.
         coloredlogs.install(
-            level=logging.DEBUG if verbose else logging.INFO,
+            level=console_level,
             fmt=CONSOLE_FORMAT,
             stream=sys.stdout,
             # Pass your custom filter to coloredlogs
@@ -139,7 +149,6 @@ def setup_logger(
         fh.addFilter(CodebaseFilter())
         root_logger.addHandler(fh)
 
-    root_logger.info(f"Logging configured")
     if log_filename is not None:
         root_logger.info(f"Logging to file: {log_filepath}")
         root_logger.log_filepath = log_filepath
@@ -157,104 +166,28 @@ def get_logger(
         if not _is_configured:
             setup_logger()
 
-    return logging.getLogger(name)
+    logger = logging.getLogger(name)
 
+    def copy_log_file(self: logging.Logger, dst_dir: str):
+        """
+        Creates a copy of the log file in the destination directory
+        """
 
-import argparse
-import logging
-from typing import Union, List, Any
+        if hasattr(self, "log_filepath"):
+            shutil.copy(
+                self.log_filepath,
+                os.path.join(dst_dir, os.path.basename(self.log_filepath)),
+            )
+        else:
+            self.warning(
+                f"Logger attempted to copy log file to {dst_dir}, but no log file was found"
+            )
+
+    logger.copy_log_file = copy_log_file.__get__(logger)
+
+    return logger
+
 
 # Set up a logger, as in the original code
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
-
-# Use a try-except block for OmegaConf imports to make the code portable
-# It will function correctly even if OmegaConf is not installed.
-try:
-    from omegaconf import DictConfig, ListConfig, OmegaConf
-
-    # Define types for broader compatibility
-    DICT_LIKE = (DictConfig, dict, argparse.Namespace)
-    LIST_LIKE = (ListConfig, list)
-    ANY_CONFIG = Union[DictConfig, ListConfig, dict, list, argparse.Namespace]
-except ImportError:
-    # Fallback definitions if OmegaConf is not installed
-    DictConfig = ListConfig = OmegaConf = None
-    DICT_LIKE = (dict, argparse.Namespace)
-    LIST_LIKE = (list,)
-    ANY_CONFIG = Union[dict, list, argparse.Namespace]
-
-
-def _generate_tree_lines(config: ANY_CONFIG, prefix: str = "") -> List[str]:
-    """
-    Recursively builds the list of strings for the configuration tree.
-
-    This helper function handles the core traversal logic for all supported types.
-    """
-    lines = []
-
-    # --- Handle Dict-like objects (dict, DictConfig, Namespace) ---
-    if isinstance(config, DICT_LIKE):
-        # Convert Namespace to dict for uniform processing
-        config_dict = vars(config) if isinstance(config, argparse.Namespace) else config
-
-        items = list(config_dict.items())
-        for i, (key, value) in enumerate(items):
-            is_last = i == len(items) - 1
-            connector = "└── " if is_last else "├── "
-            child_prefix = prefix + ("    " if is_last else "|   ")
-
-            if isinstance(value, (DICT_LIKE, LIST_LIKE)):
-                lines.append(f"{prefix}{connector}{key}:")
-                lines.extend(_generate_tree_lines(value, child_prefix))
-            else:
-                lines.append(f"{prefix}{connector}{key}: {value}")
-        return lines
-
-    # --- Handle List-like objects (list, ListConfig) ---
-    elif isinstance(config, LIST_LIKE):
-        for i, item in enumerate(config):
-            is_last = i == len(config) - 1
-            connector = "└── " if is_last else "├── "
-            child_prefix = prefix + ("    " if is_last else "|   ")
-
-            if isinstance(item, (DICT_LIKE, LIST_LIKE)):
-                # Use a hyphen for complex items (dicts/lists) inside a list
-                lines.append(f"{prefix}{connector}-")
-                lines.extend(_generate_tree_lines(item, child_prefix))
-            else:
-                lines.append(f"{prefix}{connector}{item}")
-        return lines
-
-    return lines
-
-
-def display_config(
-    config: ANY_CONFIG, config_name: str = "Config", resolve: bool = True
-) -> str:
-    """
-    Recursively prints and logs the content of a configuration object as a tree.
-    Supports argparse.Namespace, OmegaConf types, and standard Python dicts/lists.
-
-    Args:
-        config (ANY_CONFIG): The configuration object to display.
-        config_name (str, optional): The root name for the tree. Defaults to "Config".
-        resolve (bool, optional): For OmegaConf, whether to resolve interpolations
-                                (e.g., `${...}`). Defaults to True.
-
-    Returns:
-        str: The formatted configuration as a string.
-    """
-    processed_config = config
-
-    # If OmegaConf is available and the input is an OmegaConf object,
-    # convert it to a standard Python container, respecting the 'resolve' flag.
-    if OmegaConf and isinstance(config, (DictConfig, ListConfig)):
-        processed_config = OmegaConf.to_container(config, resolve=resolve)
-
-    # Start the tree with the root name
-    lines = [f"{config_name}:"]
-    lines.extend(_generate_tree_lines(processed_config))
-
-    config_text = "\n".join(lines)
-    logger.info(config_text)

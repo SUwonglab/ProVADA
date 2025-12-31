@@ -1,3 +1,3 @@
 # Example Inputs
 
-This directory contains example input files for the ProVADA pipeline.
+This directory contains example inputs for the ProVADA pipeline.

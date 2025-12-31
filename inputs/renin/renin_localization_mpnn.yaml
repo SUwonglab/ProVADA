@@ -1,0 +1,54 @@
+# Renin Localization Config File
+seed: 42
+no_wandb: true
+wandb_project: provada_renin_localization_mpnn
+
+base_variant:
+  sequence_file_path: inputs/renin/example_seq_renin.txt
+  fixed_position_files:
+    - inputs/renin/conserved_positions.txt
+    - inputs/renin/interface_positions.txt
+  structure_file_path: inputs/renin/renin_af3.pdb
+
+reference_distribution_file: inputs/renin/reference_distribution.csv
+
+sampler:
+  sampler_type: mada_topk_is
+  num_iters: 100
+  population_size: 5
+  top_k_fraction: 0.2
+  score_weights:
+    localization_prob: 1
+    sequence_similarity: 0
+    normalized_hamming_distance: 0
+    discounted_hamming_distance: 2.5
+
+
+generator:
+  generator_type: mpnn
+  generation_kwargs:
+    generations_per_sequence: 1
+    temperature: 0.3
+    omit_AAs: "C"
+
+masking_strategy:
+  masking_strategy_type: gaussian_thompson
+  masking_strategy_kwargs:
+    alpha: 2.0
+    gamma: 0.95
+
+
+masking_schedule_config:
+  type: linear
+  kwargs:
+    start_value: 0.05
+    stop_value: 0.005
+
+temperature_schedule_config:
+  type: power
+  kwargs:
+    alpha: 2.0
+    start_value: 0.4
+    stop_value: 0.1
+
+
