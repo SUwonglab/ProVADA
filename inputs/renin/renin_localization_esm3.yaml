@@ -1,0 +1,46 @@
+# Renin Localization Config File
+seed: 42
+wandb_project: provada_renin_localization_esm3
+
+base_variant:
+  sequence_file_path: inputs/renin/example_seq_renin.txt
+  fixed_position_files:
+    - inputs/renin/conserved_positions.txt
+    - inputs/renin/interface_positions.txt
+
+sampler:
+  sampler_type: mada_topk_is
+  num_iters: 100
+  population_size: 200
+  top_k_fraction: 0.2
+  score_weights:
+    localization_prob: 1
+    sequence_similarity: 0
+    normalized_hamming_distance: 2
+
+generator:
+  generator_type: esm3
+  generation_kwargs:
+    omit_AAs: "C"
+    max_batch_size: 4
+
+masking_strategy:
+  masking_strategy_type: gaussian_thompson
+  masking_strategy_kwargs:
+    alpha: 3
+    gamma: 0.95
+
+
+masking_schedule_config:
+  type: linear
+  kwargs:
+    start_value: 0.05
+    stop_value: 0.003
+
+temperature_schedule_config:
+  type: power
+  kwargs:
+    alpha: 2.0
+    start_value: 1.0
+    stop_value: 0.1
+
