@@ -90,7 +90,7 @@ See the [Components README](provada/components/README.md) for detailed guides on
 
 To run tests to ensure all functionality works, use the following command:
 ```bash
-pytest -sv
+pytest
 ```
 
 
