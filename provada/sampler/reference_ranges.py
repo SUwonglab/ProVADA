@@ -49,17 +49,17 @@ class ReferenceRangesMixin:
             f"with {number_of_sequences} sequences"
         )
 
-        # Mask sequences
+        designable = self.base_variant.num_designable_positions
+        if designable < 1:
+            raise ValueError("Reference calibration requires at least one designable residue")
+        max_masked_sites = min(
+            max(1, int(round(self.base_variant.sequence_length * 0.7))), designable
+        )
+
+        # Mask between one and max_masked_sites positions, inclusively.
         reference_dist = []
         for _ in range(number_of_sequences):
-            # Pick a random number of masked sites
-            num_masked_sites = np.random.randint(
-                1,
-                min(
-                    int(round(self.base_variant.sequence_length * 0.7)),
-                    self.base_variant.num_designable_positions,
-                ),
-            )
+            num_masked_sites = np.random.randint(1, max_masked_sites + 1)
             # Mask the sequence
             masked_sequence = mask_k(
                 sequence=self.base_variant.sequence,
@@ -110,6 +110,7 @@ class ReferenceRangesMixin:
 
         score_dfs = []
         evaluators_used = 0
+        iteration_df = self._canonical_generator_scores(iteration_df, score_subset)
 
         for evaluator in self.evaluators:
             # Check if this evaluator produces any scores in the subset
@@ -140,9 +141,7 @@ class ReferenceRangesMixin:
             )
 
             # Only keep the columns we actually need
-            columns_to_keep = ["sequence"] + [
-                col for col in score_df.columns if col in score_subset
-            ]
+            columns_to_keep = [col for col in score_df.columns if col in score_subset]
             score_df = score_df[columns_to_keep]
 
             score_dfs.append(score_df)
@@ -173,76 +172,85 @@ class ReferenceRangesMixin:
         Determines the min/max ranges for scores where min/max values are not
         specified.
         """
+        for name in self.active_scores_dict:
+            if name not in self.base_variant.score_dict:
+                raise ValueError(f"Missing active reference score '{name}'")
+            self._finite_scores([self.base_variant.score_dict[name]], f"{name} reference")
+        if not getattr(self, "normalize", True):
+            self.base_variant.normalized_score_dict = {}
+            return
+
         scores_with_unspecified_ranges = []
         for score_name, score_info in self.active_scores_dict.items():
-            # Save the specified min/max values for tracking
-            specified_min_value = score_info["min_value"]
-            if specified_min_value is None:
-                specified_min_value = "None"
-
-            self.active_scores_dict[score_name]["specified_min_value"] = specified_min_value
-
-            specified_max_value = score_info["max_value"]
-            if specified_max_value is None:
-                specified_max_value = "None"
-
-            self.active_scores_dict[score_name]["specified_max_value"] = specified_max_value
-
-            # If the min/max values are not specified, add the score to the list of scores with unspecified ranges
-            if not isinstance(score_info["min_value"], (int, float)):
-                scores_with_unspecified_ranges.append(
-                    (score_name, "min_value", score_info["min_value"])
-                )
-
-            if not isinstance(score_info["max_value"], (int, float)):
-                scores_with_unspecified_ranges.append(
-                    (score_name, "max_value", score_info["max_value"])
-                )
+            for value_type in ("min_value", "max_value"):
+                specified = score_info[value_type]
+                score_info["specified_" + value_type] = "None" if specified is None else specified
+                if isinstance(specified, str):
+                    # Attribute bounds are already known; they need no model calls.
+                    score_info[value_type] = getattr(self.base_variant, specified)
+                elif specified is None:
+                    scores_with_unspecified_ranges.append((score_name, value_type, None))
+                elif not isinstance(specified, (int, float)):
+                    raise ValueError(f"Invalid type for specified value: {specified}")
 
         # Get the reference distribution
         if len(scores_with_unspecified_ranges) > 0:
             reference_dist = self._get_reference_distribution(scores_with_unspecified_ranges)
+            for name in {name for name, _, _ in scores_with_unspecified_ranges}:
+                if name not in reference_dist or reference_dist.empty:
+                    raise ValueError(f"No reference distribution for active score '{name}'")
+                self._finite_scores(reference_dist[name], f"{name} reference distribution")
 
         # Update the min/max ranges for the scores with unspecified ranges
-        for score_name, value_type, specified in scores_with_unspecified_ranges:
-            if isinstance(specified, str):
-                self.active_scores_dict[score_name][value_type] = getattr(
-                    self.base_variant, specified
+        for score_name, value_type, _ in scores_with_unspecified_ranges:
+            if value_type == "min_value":
+                self.active_scores_dict[score_name][value_type] = min(
+                    reference_dist[score_name].quantile(0.25),
+                    self.base_variant.score_dict[score_name],
                 )
-            elif specified is None:
-                if value_type == "min_value":
-                    self.active_scores_dict[score_name][value_type] = min(
-                        reference_dist[score_name].quantile(0.25),
-                        self.base_variant.score_dict[score_name],
-                    )
-                elif value_type == "max_value":
-                    self.active_scores_dict[score_name][value_type] = max(
-                        reference_dist[score_name].quantile(0.75),
-                        self.base_variant.score_dict[score_name],
-                    )
-                else:
-                    raise ValueError(f"Invalid value type: {value_type}")
+            elif value_type == "max_value":
+                self.active_scores_dict[score_name][value_type] = max(
+                    reference_dist[score_name].quantile(0.75),
+                    self.base_variant.score_dict[score_name],
+                )
             else:
-                raise ValueError(f"Invalid type for specified value: {specified}")
+                raise ValueError(f"Invalid value type: {value_type}")
+
+        # Sparse or discrete metrics can have tied quartiles despite varying
+        # across calibration sequences. Widen only estimated bounds to the
+        # observed range; explicitly supplied bounds remain unchanged.
+        for score_name in {name for name, _, _ in scores_with_unspecified_ranges}:
+            score_info = self.active_scores_dict[score_name]
+            if score_info["min_value"] != score_info["max_value"]:
+                continue
+            estimated_bounds = {
+                value_type for name, value_type, _ in scores_with_unspecified_ranges
+                if name == score_name
+            }
+            if "min_value" in estimated_bounds:
+                score_info["min_value"] = float(min(
+                    reference_dist[score_name].min(), score_info["min_value"]
+                ))
+            if "max_value" in estimated_bounds:
+                score_info["max_value"] = float(max(
+                    reference_dist[score_name].max(), score_info["max_value"]
+                ))
+            if score_info["max_value"] <= score_info["min_value"]:
+                raise ValueError(
+                    f"Active score '{score_name}' has no calibration spread; provide "
+                    "explicit finite bounds with max_value > min_value or set normalize=False"
+                )
+            logger.warning(
+                f"Tied calibration quartiles for '{score_name}'; using observed bounds "
+                f"[{score_info['min_value']}, {score_info['max_value']}]"
+            )
 
         # Determine base variant normalized scores
         self.base_variant.normalized_score_dict = {}
         for score_name, score_info in self.active_scores_dict.items():
-            self.base_variant.normalized_score_dict[score_name] = (
-                self.base_variant.score_dict[score_name] - score_info["min_value"]
-            ) / (score_info["max_value"] - score_info["min_value"])
-
-            # Ensure it is in the range
-            if abs(self.base_variant.normalized_score_dict[score_name]) > 1:
-                raise ValueError(
-                    f"BaseVariant should not be out of range after range determination"
-                )
-
-            # Flip score if larger is not better
-            if not score_info["larger_is_better"]:
-                self.base_variant.normalized_score_dict[score_name] = (
-                    1 - self.base_variant.normalized_score_dict[score_name]
-                )
+            self.base_variant.normalized_score_dict[score_name] = float(
+                self._fitness_component([self.base_variant.score_dict[score_name]], score_name, score_info)[0]
+            )
 
         # Log active scores to wandb
         if self.wandb_run is not None:

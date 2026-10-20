@@ -1,7 +1,9 @@
-# Renin Localization Config File
+# Renin Localization Config File (ProteinMPNN generator)
+# Sampling settings follow Table S3 of the pre-print, for the cytosolic renin
+# design campaign.
 seed: 42
 no_wandb: true
-wandb_project: provada_renin_localization_mpnn
+wandb_project: new_provada_renin_mpnn
 
 base_variant:
   sequence_file_path: inputs/renin/example_seq_renin.txt
@@ -10,45 +12,31 @@ base_variant:
     - inputs/renin/interface_positions.txt
   structure_file_path: inputs/renin/renin_af3.pdb
 
-reference_distribution_file: inputs/renin/reference_distribution.csv
-
 sampler:
-  sampler_type: mada_topk_is
-  num_iters: 100
-  population_size: 5
+  sampler_type: mada
+  greedy: true
+  num_iters: 300
+  population_size: 30
   top_k_fraction: 0.2
+  normalize: false
   score_weights:
     localization_prob: 1
-    sequence_similarity: 0
-    normalized_hamming_distance: 0
-    discounted_hamming_distance: 2.5
-
+    normalized_hamming_distance: 0.2
+    mpnn_score: 0.1
 
 generator:
-  generator_type: mpnn
-  generation_kwargs:
-    generations_per_sequence: 1
-    temperature: 0.3
-    omit_AAs: "C"
+  generator_type: mpnn_pytorch
+  generations_per_sequence: 1
+  temperature: 0.5
+  excluded_amino_acids: ["C"]
 
-masking_strategy:
-  masking_strategy_type: gaussian_thompson
-  masking_strategy_kwargs:
-    alpha: 2.0
-    gamma: 0.95
+masking_schedule:
+  schedule_type: power
+  alpha: 3.0
+  start_value: 0.2
+  stop_value: 0.05
 
-
-masking_schedule_config:
-  type: linear
-  kwargs:
-    start_value: 0.05
-    stop_value: 0.005
-
-temperature_schedule_config:
-  type: power
-  kwargs:
-    alpha: 2.0
-    start_value: 0.4
-    stop_value: 0.1
-
-
+temperature_schedule:
+  schedule_type: geometric
+  start_value: 2.0
+  stop_value: 0.1

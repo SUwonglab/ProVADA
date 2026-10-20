@@ -69,7 +69,7 @@ class Linear(ParameterSchedule):
         """
         Returns the value of the parameter at the given iteration.
         """
-        frac = iteration / (self.total_iters - 1)
+        frac = iteration / max(self.total_iters - 1, 1)
         return self.start_value + (self.stop_value - self.start_value) * frac
 
 
@@ -145,7 +145,7 @@ class PowerLaw(ParameterSchedule):
         Returns the value of the parameter at the given iteration.
         """
 
-        frac = iteration / (self.total_iters - 1)
+        frac = iteration / max(self.total_iters - 1, 1)
 
         return self.start_value + (self.stop_value - self.start_value) * (
             frac**self.alpha

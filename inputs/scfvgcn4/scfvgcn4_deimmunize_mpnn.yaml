@@ -1,0 +1,42 @@
+# scfvgcn4 deimmune Config File
+seed: 42
+wandb_project: provada_deimmunization_scfvgcn4
+
+base_variant:
+  sequence_file_path: inputs/scfvgcn4/wt_seq.txt
+  fixed_position_files:
+    - inputs/scfvgcn4/scfvgcn4_fixed_positions_martin_excludecys.txt
+  structure_file_path: inputs/scfvgcn4/fold_scfvgcn4_monomer_model_0.cif
+  # Immunogenicity parameters. Quoted because the allele names contain '*'.
+  mhc_alleles: "HLA-A*02:01, HLA-B*07:02"
+  exclude_self_peptides: true
+
+sampler:
+  sampler_type: mada
+  greedy: true
+  num_iters: 300
+  population_size: 40
+  top_k_fraction: 0.2
+  normalize: false
+  score_weights:
+    immunogenicity_score: 1
+    sequence_similarity: 0
+    normalized_hamming_distance: 0
+    mpnn_score: 0.2
+
+generator:
+  generator_type: mpnn
+  generations_per_sequence: 1
+  temperature: 0.3
+  excluded_amino_acids: ["C"]
+
+masking_schedule:
+  schedule_type: linear
+  start_value: 0.1
+  stop_value: 0.008
+
+temperature_schedule:
+  schedule_type: power
+  alpha: 2
+  start_value: 0.05
+  stop_value: 0.01

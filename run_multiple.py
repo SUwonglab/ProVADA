@@ -58,13 +58,21 @@ def main():
 
         seed = rng.randint(0, 1000000)
 
-        command = f"python run_provada.py --config {args.config} --device cuda:0 --seed {seed} --logging_subdir {logging_subdir}"
+        # Overrides use onefig's native `field=value` form rather than flags, so
+        # they need no normalization on the receiving end.
+        command = (
+            f"python run_provada.py --config {args.config}"
+            f" seed={seed} logging_subdir={logging_subdir}"
+        )
 
         if args.reference_distribution_file is not None:
-            command += f" --reference_distribution_file {args.reference_distribution_file}"
+            command += f" reference_distribution_file={args.reference_distribution_file}"
 
         if args.sampler_type is not None:
-            command += f" --sampler_type {args.sampler_type}"
+            command += f" sampler_type={args.sampler_type}"
+
+        if args.verbose:
+            command += " verbose=true"
 
         # Create temporary files to capture stdout/stderr
         temp_stdout = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.stdout')
@@ -124,7 +132,10 @@ def main():
                     log_file.write(f"EARLY FAILURE - Process exited with code {exit_code}\n")
                     log_file.write(f"GPU: {gpu}, Seed: {seed}\n")
                     log_file.write(f"Config: {args.config}\n")
-                    log_file.write(f"Command: python run_provada.py --config {args.config} --device cuda:0 --seed {seed}\n")
+                    log_file.write(
+                        f"Command: CUDA_VISIBLE_DEVICES={gpu} python "
+                        f"run_provada.py --config {args.config} seed={seed}\n"
+                    )
                     log_file.write(f"=" * 80 + "\n\n")
 
                     # Read and write stderr (most likely to contain the error)

@@ -151,6 +151,8 @@ def test_evaluators(evaluator_class):
         or evaluator_class.__name__ == "DiscountedHammingDistance"
     ):
         other_kwargs["reference_sequence_or_sequences"] = GFP
+    elif evaluator_class.__name__=="ImmunogenicityMetrics":
+        other_kwargs["mhc_alleles"] = ["HLA-A*02:01", "HLA-B*07:02"]
 
     # Run on the first sequences
     input_copy = df_sequences.copy(deep=True)
@@ -561,3 +563,83 @@ def test_sequence_similarity_partial_designable_positions():
     assert (
         df["levenshtein_distance"].iloc[0] == 2
     ), f"Expected levenshtein_distance=2 but got {df['levenshtein_distance'].iloc[0]}"
+
+
+def test_sequence_similarity_multichain_designable_chain():
+    """
+    Tests that a multichain sequence is compared over the designable chain only,
+    and that the designable-position filter composes with that restriction.
+
+    Both filters are applied in full-sequence coordinates, so this pins the
+    behaviour that neither has to rebase the other's indices, and that the '/'
+    separator — which matches itself in every pair — never reaches a metric.
+    """
+    from pathlib import Path
+
+    from provada.base_variant import BaseVariant
+    from provada.sequences.io import get_sequence
+
+    test_inputs = Path("tests/test_inputs")
+    sequence = get_sequence(test_inputs / "test_complex_seq.fasta")
+    variant = BaseVariant(
+        sequence=sequence,
+        structure=test_inputs / "test_complex.pdb",
+        # A1-A20 fixed, and all of chain B.
+        fixed_indices=get_fixed_positions_from_file(
+            test_inputs / "test_complex_fixed_positions.txt", assume_1_indexed=True
+        ),
+    )
+    chains = sequence.split("/")
+    assert len(chains) == 2
+    assert variant.designable_chain_index == 0
+
+    # Mutate 10 residues inside chain A's designable region (A21 onwards).
+    mutant = list(sequence)
+    for i in range(20, 30):
+        mutant[i] = "A" if mutant[i] != "A" else "G"
+    mutant = "".join(mutant)
+
+    # Without the designable filter, the comparison is the designable chain
+    # whole — which is what the previous chain-extraction behaviour did.
+    evaluator = EVALUATOR_REGISTRY.get_instance(
+        "sequence_similarity",
+        only_consider_designable=False,
+        active_scores=["sequence_identity", "levenshtein_distance"],
+    )
+    kwargs = evaluator.get_extra_kwargs(variant)
+    positions = evaluator._positions_to_compare(
+        sequence,
+        kwargs["fixed_position_indices"],
+        kwargs["sequence_length"],
+        kwargs["designable_chain_index"],
+    )
+    kept = "".join(sequence[i] for i in positions)
+    assert kept == chains[0], "Should compare exactly the designable chain"
+    assert "/" not in kept, "A chain separator is not a residue"
+
+    df_all = evaluator.evaluate(sequences=[mutant], **kwargs)
+    assert df_all["levenshtein_distance"].iloc[0] == 10
+
+    # With it, only chain A's designable positions are compared, so the same 10
+    # mutations are a larger fraction of a smaller region.
+    evaluator_designable = EVALUATOR_REGISTRY.get_instance(
+        "sequence_similarity",
+        only_consider_designable=True,
+        active_scores=["sequence_identity", "levenshtein_distance"],
+    )
+    kwargs = evaluator_designable.get_extra_kwargs(variant)
+    positions = evaluator_designable._positions_to_compare(
+        sequence,
+        kwargs["fixed_position_indices"],
+        kwargs["sequence_length"],
+        kwargs["designable_chain_index"],
+    )
+    assert min(positions) == 20, "Chain A's first 20 residues are fixed"
+    assert max(positions) == len(chains[0]) - 1, "Chain B is fixed in full"
+
+    df_designable = evaluator_designable.evaluate(sequences=[mutant], **kwargs)
+    assert df_designable["levenshtein_distance"].iloc[0] == 10
+    assert (
+        df_designable["sequence_identity"].iloc[0]
+        < df_all["sequence_identity"].iloc[0]
+    ), "Dropping the fixed positions should concentrate the same differences"

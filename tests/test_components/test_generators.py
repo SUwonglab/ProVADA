@@ -63,43 +63,36 @@ def helper_test_generation_function(generator, prompts, **kwargs):
 
 @pytest.mark.requires_gpu
 def test_esm3_generator():
+    """The ESM3 generator returns one usable generation per prompt.
 
+    What a generation looks like residue by residue — masks filled, unmasked
+    positions untouched, excluded residues absent — is proto-tools' contract
+    and is tested there. What is left here is the wiring on this side, which
+    helper_test_generation_function covers: the input frame is not mutated, the
+    extra columns survive, each row keeps its own prompt, and the result is a
+    valid protein sequence.
+    """
     seed_everything(42)
 
     prompts = [mask_k(GFP, 10) for _ in range(10)]
-
     esm3_generator = GENERATOR_REGISTRY.get_instance("esm3")
 
     generations = helper_test_generation_function(
-        esm3_generator, prompts, max_batch_size=5, omit_AAs="C"
+        esm3_generator, prompts, max_batch_size=5, excluded_amino_acids=["C"]
     )
 
-    # Check generation shape
-    assert (
-        len(generations) == 10
-    ), "Number of generations should be equal to the number of sequences"
-
-    # Sanity check generations
-    for prompt, generation in zip(prompts, generations.to_dict(orient="records")):
-        for i in range(len(prompt)):
-            if prompt[i] == "_":
-                # If this is a designable position, make sure the generation is not a Cysteine residue
-                assert (
-                    generation["sequence"][i] != "C"
-                ), "Generation contains Cysteine residue in masked position"
-
-            else:
-                # If this is not a designable position, make sure the generation is the same as the original sequence
-                assert (
-                    generation["sequence"][i] == prompt[i]
-                ), "Generation is not the same as the original sequence in non-masked position"
-
-    for prompt, generation in zip(prompts, generations.to_dict(orient="records")):
-        assert generation["prompt"] == prompt, "Prompt is incorrect"
+    assert len(generations) == len(prompts), "Expected one generation per prompt"
 
 
 @pytest.mark.requires_gpu
-def test_mpnn_generator():
+@pytest.mark.parametrize("generator_name", ["mpnn", "mpnn_pytorch"])
+def test_mpnn_generator(generator_name):
+    """Both ProteinMPNN toolkits honour the prompt, the exclusion and the seed.
+
+    The two implementations do not produce the same designs — they apply the
+    prompt differently — so this asserts the contract both share rather than
+    comparing them to each other.
+    """
 
     test_pdb_path = Path("inputs/renin/renin_af3.pdb")
     test_sequence_path = Path("inputs/renin/example_seq_renin.txt")
@@ -111,8 +104,10 @@ def test_mpnn_generator():
 
     # Mask a bunch of sequences
     prompts = [mask_k(wt_seq, 10) for _ in range(2)]
+    # make sure all Cs are masked
+    prompts = ["".join([aa if aa != "C" else "_" for aa in prompt]) for prompt in prompts]
 
-    mpnn_generator = GENERATOR_REGISTRY.get_instance("mpnn", seed=42)
+    mpnn_generator = GENERATOR_REGISTRY.get_instance(generator_name, seed=42)
 
     generations_per_sequence = 10
 
@@ -122,7 +117,7 @@ def test_mpnn_generator():
         structure_or_structures=test_pdb_path,
         generations_per_sequence=generations_per_sequence,
         temperature=0.2,
-        omit_AAs="CX",
+        excluded_amino_acids=["C", "X"],
     ).to_dict(orient="records")
 
     # Make list of prompts for comparision (since prompts produce multiple generations)
@@ -138,14 +133,23 @@ def test_mpnn_generator():
         len(first_generations) == len(prompts) * generations_per_sequence
     ), "Number of generations should be equal to the number of prompts times the number of generations per prompt for MPNN"
 
+    # ensure that no generated sequences contain omitted amino acids
+    for gen in first_generations:
+        for aa in "CX":
+            assert aa not in gen["sequence"], f"Omitted amino acid {aa} found in generated sequence."
+    
+    # ensure there is no identical generatoins in the first generations
+    generated_seqs = [gen["sequence"] for gen in first_generations]
+    assert len(generated_seqs) == len(set(generated_seqs)), "There are identical generations in the first generations!"
+
     # Create a new generator with the same prompts and structure
-    mpnn_generator_2 = GENERATOR_REGISTRY.get_instance("mpnn", seed=42)
+    mpnn_generator_2 = GENERATOR_REGISTRY.get_instance(generator_name, seed=42)
     second_generations = mpnn_generator_2.generate(
         prompts=prompts,
         structure_or_structures=test_pdb_path,
         generations_per_sequence=generations_per_sequence,
         temperature=0.2,
-        omit_AAs="CX",
+        excluded_amino_acids=["C", "X"],
     ).to_dict(orient="records")
 
     # Ensure all the scores and sequences are the same
@@ -246,3 +250,33 @@ def test_random_generator():
     assert (
         len(generations) == 10
     ), "Number of generations should be equal to the number of prompts"
+
+
+# ============================================================================
+# Masked-model generators (ESM2 / ESM3 via proto-tools)
+# ============================================================================
+
+
+@pytest.mark.requires_gpu
+@pytest.mark.parametrize("sampling_method", ["iterative_refinement", "single_pass"])
+def test_esm2_generator(sampling_method):
+    """The ESM2 generator returns one usable generation per prompt.
+
+    Smallest checkpoint on purpose: this exercises the dispatch path, not the
+    model. See test_esm3_generator for what is deliberately not asserted here.
+    """
+    seed_everything(42)
+
+    prompts = [mask_k(GFP, 10) for _ in range(4)]
+    esm2_generator = GENERATOR_REGISTRY.get_instance("esm2", device="cpu")
+
+    generations = helper_test_generation_function(
+        esm2_generator,
+        prompts,
+        max_batch_size=4,
+        model_checkpoint="esm2_t6_8M_UR50D",
+        sampling_method=sampling_method,
+        excluded_amino_acids=["C"],
+    )
+
+    assert len(generations) == len(prompts), "Expected one generation per prompt"

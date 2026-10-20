@@ -1,0 +1,1 @@
+protein_mpnn @ git+https://github.com/bviggiano/ProteinMPNN.git@d374c5a264bf522df432a872cf631f3fe32b39d5

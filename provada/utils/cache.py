@@ -7,7 +7,7 @@ Helper functions for caching data
 import os
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
-from threading import Semaphore
+from threading import Lock, Semaphore
 from typing import Dict
 from provada.utils.log import get_logger
 
@@ -31,6 +31,8 @@ class CSVCache:
         self.csv_path = csv_path
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.semaphore = Semaphore(max_pending_writes)
+        self._error_lock = Lock()
+        self._write_error = None
 
         logger.info(f"Initialized CSVCache at {csv_path}")
 
@@ -44,11 +46,25 @@ class CSVCache:
         are not already in the csv file each call.
         """
 
-        # Block if too many writes are pending for this specific path
+        self._raise_write_error()
+
+        # Block if too many writes are pending for this specific path.
         self.semaphore.acquire()
 
-        # Submit to this path's dedicated thread
-        self.executor.submit(self._write_csv_impl, df.copy())
+        try:
+            # A preceding write may have failed while this producer was waiting.
+            self._raise_write_error()
+            self.executor.submit(self._write_csv_impl, df.copy())
+        except BaseException:
+            # No worker owns this slot when copying or submission fails.
+            self.semaphore.release()
+            raise
+
+    def _raise_write_error(self):
+        with self._error_lock:
+            error = self._write_error
+        if error is not None:
+            raise error
 
     def _write_csv_impl(self, df: pd.DataFrame):
         try:
@@ -62,11 +78,19 @@ class CSVCache:
             else:
                 # Otherwise, append the entries to the file
                 df.to_csv(self.csv_path, index=False, header=False, mode="a")
+        except BaseException as error:
+            # Retain only the first failure, rather than every completed future.
+            with self._error_lock:
+                if self._write_error is None:
+                    error.add_note(f"CSV write failed for {self.csv_path}")
+                    self._write_error = error
+            raise
         finally:
             self.semaphore.release()
 
     def shutdown(self):
         self.executor.shutdown(wait=True)
+        self._raise_write_error()
 
 
 # Global cache manager
@@ -99,6 +123,18 @@ def cache_to_csv(df: pd.DataFrame, path: str) -> None:
 
 def shutdown_cache():
     """Shutdown all path-specific caches"""
-    for cache in _path_caches.values():
-        cache.shutdown()
-    _path_caches.clear()
+    errors = []
+    try:
+        for path, cache in list(_path_caches.items()):
+            try:
+                cache.shutdown()
+            except BaseException as error:
+                errors.append((path, error))
+    finally:
+        _path_caches.clear()
+    if errors:
+        path, error = errors[0]
+        error.add_note(f"CSV cache shutdown failed for {path}")
+        for other_path, other_error in errors[1:]:
+            error.add_note(f"Additional cache shutdown failure for {other_path}: {other_error}")
+        raise error

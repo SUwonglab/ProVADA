@@ -24,7 +24,8 @@ def load_run_data(
     """
     Load and process the complete trajectory data from a provada run directory.
 
-    This function loads both the generated_sequences.csv and trajectory.csv files,
+    This function loads sequence_lookup.csv and trajectory.csv (falling back to
+    generated_sequences.csv for older runs),
     optionally removes duplicate sequences, bins the trajectory by iteration,
     and merges the sequence scores into the trajectory dataframe.
 
@@ -57,7 +58,9 @@ def load_run_data(
         raise FileNotFoundError(f"Result directory not found: {result_dir}")
 
     # Define paths to the required files
-    sequences_path = result_dir / "generated_sequences.csv"
+    sequences_path = result_dir / "sequence_lookup.csv"
+    if not sequences_path.exists():
+        sequences_path = result_dir / "generated_sequences.csv"
     trajectory_path = result_dir / "trajectory.csv"
 
     # Check that files exist
@@ -140,7 +143,8 @@ def bin_by_iteration(
     if num_bins is None:
         num_bins = num_iterations
 
-    bin_boundaries = np.linspace(0, num_iterations, num_bins + 1)
+    first_iteration = min(0, trajectory_df[iteration_col].min())
+    bin_boundaries = np.linspace(first_iteration, num_iterations, num_bins + 1)
 
     # Assign each instance to a bin
     trajectory_df["iteration_bin_range"] = pd.cut(
@@ -187,12 +191,15 @@ def merge_scores_into_trajectory(
     trajectory_df = trajectory_df.copy()
     sequences_df = sequences_df.copy()
 
+    # Schema v2 explicitly separates generated children from retained states.
+    if "selected_sequence_hash" in trajectory_df:
+        trajectory_df["sequence_hash"] = trajectory_df["selected_sequence_hash"]
+
     # Hash all sequences in sequences_df
     logger.debug("Hashing sequences for merge")
     sequences_df["sequence_hash"] = sequences_df["sequence"].apply(hash_sequence)
 
-    # Drop the sequence column to avoid redundancy
-    sequences_df = sequences_df.drop(columns=["sequence"])
+    # Keep the retained sequence itself so saved populations can be reconstructed.
 
     # Merge the scores into the trajectory dataframe
     logger.debug(
@@ -215,4 +222,7 @@ def merge_scores_into_trajectory(
             f"{unmatched} trajectory entries did not match any sequences in generated_sequences.csv"
         )
 
+    if "selected_SCORE" in trajectory_df and "SCORE" in trajectory_df:
+        if not np.allclose(trajectory_df["selected_SCORE"], trajectory_df["SCORE"], rtol=1e-10, atol=1e-10):
+            raise ValueError("Saved retained-state scores do not match the sequence lookup")
     return trajectory_df

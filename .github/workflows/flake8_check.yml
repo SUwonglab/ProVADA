@@ -1,4 +1,3 @@
-# .github/workflows/flake8_check.yml
 name: Lint Check
 
 on:

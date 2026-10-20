@@ -7,6 +7,7 @@ Tests the Sampler class
 import pytest
 from provada.sampler.sampler import SAMPLER_REGISTRY
 from provada.base_variant import BaseVariant
+from provada.config import PowerScheduleConfig
 from provada.utils.setup import init_wandb
 from provada.utils.env import suppress_console_output
 
@@ -37,21 +38,16 @@ def test_sampler(sampler_name, score_weights):
         "score_weights": score_weights,
         "generator_type": "random",
         "generation_kwargs": {"codon_scheme": "NNK"},
-        "temperature_schedule_config": {
-            "type": "power",
-            "kwargs": {"alpha": 3.0, "start_value": 5.0, "stop_value": 0.1},
-        },
+        "temperature_schedule_config": PowerScheduleConfig(
+            alpha=3.0, start_value=5.0, stop_value=0.1
+        ),
         "seed": 42,
-        "device": "cpu",
         "run_name": f"test_{sampler_name}_seqsim_{score_weights['sequence_similarity']}",
         "output_dir": "results/test_results",
         "sampler_name": sampler_name,
-        "masking_strategy_type": "gaussian_thompson",
-        "masking_strategy_kwargs": {"alpha": 2.0, "gamma": 0.95},
-        "masking_schedule_config": {
-            "type": "power",
-            "kwargs": {"start_value": 0.2, "stop_value": 0.05, "alpha": 2.0},
-        },
+        "masking_schedule_config": PowerScheduleConfig(
+            start_value=0.2, stop_value=0.05, alpha=2.0
+        ),
     }
 
     # Initialize wandb run
@@ -74,12 +70,9 @@ def test_sampler(sampler_name, score_weights):
         score_weights=test_config["score_weights"],
         generator_type=test_config["generator_type"],
         generation_kwargs=test_config["generation_kwargs"],
-        masking_strategy_type=test_config["masking_strategy_type"],
-        masking_strategy_kwargs=test_config["masking_strategy_kwargs"],
         masking_schedule_config=test_config["masking_schedule_config"],
         temperature_schedule_config=test_config["temperature_schedule_config"],
         seed=test_config["seed"],
-        device=test_config["device"],
         run_name=test_config["run_name"],
         output_dir=test_config["output_dir"],
         wandb_run=wandb_run,

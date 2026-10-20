@@ -4,9 +4,27 @@ This module provides utilities for analyzing and visualizing the results of prov
 
 ## Features
 
-- **Data Loading**: Load and merge trajectory data with sequence scores
-- **Static Visualization**: Create beautiful scatter plots with gradient coloring
-- **Animated Visualization**: Generate MOV videos showing trajectory evolution over time
+- **Data loading**: read a run's trajectory with each sequence's scores merged in
+- **Visualization**: scatter plots of the trajectory through score space
+
+## What a run writes
+
+`sequence_lookup.csv` holds the scores of every evaluated state, the reference
+and the initial particles included. `load_run_data` joins the trajectory to it
+by the retained-state hash, so every row carries the identity and scores of both
+the sequence that was generated and the one that was kept.
+
+`final_population.csv` holds the final particles, duplicates included.
+Initialization rows carry iteration `-1`.
+
+To reconstruct the particle population at any iteration, repeat each row by the
+number of particles that retained it:
+
+```python
+rows = load_run_data(result_dir)
+rows = rows[rows["iteration"] == iteration]
+population = rows.loc[rows.index.repeat(rows["selected_count"])]
+```
 
 ### Loading Data
 
@@ -37,55 +55,6 @@ fig = show_trajectory_plot(
 plt.show()
 ```
 
-### Animated Videos
-
-```python
-from analyze import create_trajectory_animation
-
-# Create an animated MOV video showing trajectory evolution
-# Output is saved to analyze/output/{result_name}/trajectory.mov
-create_trajectory_animation(
-    df,
-    x="localization_prob",
-    y="sequence_similarity",
-    output_path="trajectory.mov",
-    result_name="my_run_2024_01_15",  # Organizes outputs by run name
-    fps=30,                            # Frames per second
-    cmap="plasma",                     # Colormap
-    # Auto-calculated parameters for ~1-2 minute generation time
-)
-
-# Use nonlinear distribution to focus more frames on early trajectory
-create_trajectory_animation(
-    df,
-    x="localization_prob",
-    y="sequence_similarity",
-    output_path="trajectory_early_focus.mov",
-    result_name="my_run",
-    linear_distribution=False,  # More frames for early iterations
-)
-```
-
-### Multi-Plot Animations
-
-```python
-from analyze import create_multi_trajectory_animation
-
-# Create side-by-side animations
-# Output is saved to analyze/output/{result_name}/multi_trajectory.mov
-create_multi_trajectory_animation(
-    df,
-    plot_configs=[
-        ("score1", "score2"),
-        ("score1", "score3"),
-        ("score2", "score3"),
-    ],
-    output_path="multi_trajectory.mov",
-    result_name="my_run_2024_01_15",
-    fps=30,
-)
-```
-
 ## Module Structure
 
 - `loading.py`: Functions for loading and processing run data
@@ -95,8 +64,6 @@ create_multi_trajectory_animation(
 
 - `plotting.py`: Visualization functions
   - `show_trajectory_plot()`: Create static scatter plots with gradients
-  - `create_trajectory_animation()`: Generate animated MOV videos
-  - `create_multi_trajectory_animation()`: Generate multi-plot MOV videos
 
 
 ## Color Gradients
@@ -111,14 +78,12 @@ Recommended colormaps:
 - `coolwarm`: Diverging colormap, blue to red
 - `RdYlBu`: Red-Yellow-Blue diverging
 
+## Worked example
+
+[`example_notebook.ipynb`](./example_notebook.ipynb) runs through all of this
+against a real run: loading, the score columns a run carries, the trajectory
+plot, fitness over iterations, and reconstructing a population.
+
 ## Tips
 
-- Use `result_name` parameter to organize outputs in `analyze/output/{result_name}/` folders
-- Use `linear_distribution=False` to allocate more frames to early iterations (when trajectories change most)
-- Use `points_per_frame` to manually control animation speed (higher = faster)
-- Use `max_frames` to set a specific frame count target (default: 50-80 based on dataset size)
-- Use `fps` to control playback smoothness (30 is standard)
-- Use `show_final_frames` to hold the final complete plot
 - Use `alpha` parameter to control point transparency for dense plots
-- The dataframe is automatically sorted by iteration for animations
-- Animation parameters are auto-calculated for ~1-2 minute generation time

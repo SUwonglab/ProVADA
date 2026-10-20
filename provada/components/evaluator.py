@@ -5,22 +5,18 @@ Contains the Evaluator class, which is used to score sequences
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Union, Optional, Dict, Any
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 import os
-import pathlib
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import pickle
+import numpy as np
 import pandas as pd
-from provada.models.esm2 import ESM2Model
-from provada.models.esm3 import ESM3Model
 
-import io
-import freesasa
-from Bio.PDB import PDBParser
 
-from provada.utils.env import device_manager, lock_via_lockfile
-from provada.utils.multiprocess import get_pool, _worker_local
+from provada.paths import REPO_ROOT
+from provada.utils.env import resolve_device
 
 from provada.sequences.pairwise_metrics import (
     get_pairwise_metric,
@@ -30,7 +26,12 @@ from provada.utils.log import get_logger
 from provada.sequences.io import hash_sequence
 from provada.utils.registry import EVALUATOR_REGISTRY
 
+
 logger = get_logger(__name__)
+
+#: Localization classifier shipped with the renin example. Anchored to the
+#: repository root so a run started from any working directory finds it.
+DEFAULT_CLASSIFIER_PATH = REPO_ROOT / "inputs" / "renin" / "logreg_model.pkl"
 
 
 class Evaluator(ABC):
@@ -40,6 +41,7 @@ class Evaluator(ABC):
         seed: int = 42,
         active_scores: List[str] = None,
         use_cache: bool = True,
+        device: Optional[str] = None,
     ):
         """
         Initializes the evaluator.
@@ -49,9 +51,15 @@ class Evaluator(ABC):
             active_scores: The list of scores to activate for this evaluator. If
                 not provided, all scores will be returned.
             use_cache: Whether to use the cache for the evaluator.
+            device: The device string to forward to any model this evaluator
+                calls. Passed through to proto-tools, whose DeviceManager owns
+                placement; ``None`` leaves the tool's own default in place.
         """
         # Store the seed
         self.seed = seed
+
+        # Forwarded to proto-tools tool configs; not used to move models here.
+        self.device = device
 
         # Store the use cache flag
         self.use_cache = use_cache
@@ -72,39 +80,6 @@ class Evaluator(ABC):
             active_scores = list(self.available_scores().keys())
 
         self.active_scores = active_scores
-
-        # Run the initialization function for the evaluator
-        init_fn = getattr(self, "worker_init")
-
-        logger.debug(f"Running worker init function for {self.__class__.__name__}")
-        get_pool().run_init(init_fn, self.__class__.__name__)
-
-        # Get the ctx status
-        ctx_status_list = get_pool().get_ctx_status()
-        for ind, ctx_status in enumerate(ctx_status_list):
-            # Check if worker has proper status structure
-            if "success_list" not in ctx_status:
-                raise Exception(
-                    f"Worker {ind} has no initialization history - worker may have died during {self.__class__.__name__} initialization"
-                )
-
-            # Pull the latest status update
-            success = ctx_status["success_list"][-1]
-            retry_count = ctx_status["retry_count_list"][-1]
-            message = ctx_status["message_list"][-1]
-
-            if not success:
-                raise Exception(
-                    f"Error initializing {self.__class__.__name__} in worker {ind}: {message}"
-                )
-            elif retry_count > 0:
-                logger.warning(
-                    f"Was able to initialize {self.__class__.__name__} in worker {ind} after {retry_count} retries"
-                )
-            elif message != "":
-                logger.debug(
-                    f"Message from {self.__class__.__name__} in worker {ind}: {message}"
-                )
 
         logger.info(
             f"Successfully initialized {self.__class__.__name__} with the following active scores: {self.active_scores}"
@@ -254,21 +229,11 @@ class Evaluator(ABC):
                 raise ValueError(
                     f"evaluate_sequences method of {self.__class__.__name__} returned None"
                 )
-
+            
         # Always call post_eval after evaluation
         final_outputs = self.post_eval(seq_df, eval_df)
 
         return final_outputs
-
-    @staticmethod
-    def worker_init():
-        """
-        Optional initialization for worker processes.
-        Should return a dict of objects to be stored in the worker context.
-        Example:
-            return {"pyrosetta": pyrosetta, "pose_from_pdbstring": pose_from_pdbstring}
-        """
-        return {"success": True}
 
     def get_extra_kwargs(self, base_variant):
         """
@@ -379,6 +344,7 @@ class SequenceSimilarity(Evaluator):
         active_scores: List[str] = None,
         use_cache: bool = False,
         only_consider_designable: bool = True,
+        device: Optional[str] = None,
     ):
         # Do not allow the use of the cache for this evaluator
         if use_cache:
@@ -386,7 +352,9 @@ class SequenceSimilarity(Evaluator):
                 "The cache is automatically disabled for the SequenceSimilarity evaluator since the reference sequence can change between evaluations"
             )
         self.only_consider_designable = only_consider_designable
-        super().__init__(seed=seed, active_scores=active_scores, use_cache=False)
+        super().__init__(
+            seed=seed, active_scores=active_scores, use_cache=False, device=device
+        )
 
     @classmethod
     def available_scores(cls) -> List[str]:
@@ -408,72 +376,124 @@ class SequenceSimilarity(Evaluator):
         """
         SequenceSimilarity requires a reference sequence for comparison.
         """
-        return {
+        extra_kwargs = {
             "reference_sequence_or_sequences": base_variant.sequence,
             "fixed_position_indices": base_variant.fixed_position_indices,
             "sequence_length": base_variant.sequence_length,
         }
 
+        # Check for single designable chain requirement if base variant is multichain
+        if base_variant.sequence and '/' in base_variant.sequence:
+             try:
+                 extra_kwargs["designable_chain_index"] = base_variant.designable_chain_index
+             except ValueError as e:
+                 logger.warning(f"Could not determine designable chain index: {e}. Evaluator might fail or evaluate full sequence.")
+
+        return extra_kwargs
+
+    def _positions_to_compare(
+        self,
+        reference: str,
+        fixed_position_indices: Optional[List[int]],
+        sequence_length: Optional[int],
+        designable_chain_index: Optional[int],
+    ) -> Optional[List[int]]:
+        """Which positions of the full sequence a metric should see.
+
+        Both filters are applied in full-sequence coordinates — ``/`` separators
+        included, the way ``base_variant.fixed_position_indices`` and
+        ``sequence_length`` are measured — so neither has to rebase the other's
+        indices.
+
+        Args:
+            reference: A reference sequence, used for its chain layout.
+            fixed_position_indices: Positions held fixed during design.
+            sequence_length: Length of the full sequence.
+            designable_chain_index: Chain to restrict to, or None for all.
+
+        Returns:
+            Positions to keep, or None to compare the sequences whole.
+        """
+        length = sequence_length if sequence_length is not None else len(reference)
+        keep = range(length)
+
+        # Restrict to one chain. Its span is measured the way
+        # base_variant.designable_chain_index measures it: a separator per chain.
+        if designable_chain_index is not None:
+            chains = reference.split("/")
+            if designable_chain_index < len(chains):
+                start = sum(len(chain) + 1 for chain in chains[:designable_chain_index])
+                keep = range(start, start + len(chains[designable_chain_index]))
+
+        positions = list(keep)
+
+        # Drop the fixed positions, so only designed residues are compared.
+        if self.only_consider_designable and fixed_position_indices is not None:
+            fixed = set(fixed_position_indices)
+            positions = [i for i in positions if i not in fixed]
+
+        # A separator is not a residue, and matches itself in every pair, so it
+        # would inflate every similarity score.
+        positions = [i for i in positions if i < len(reference) and reference[i] != "/"]
+
+        if len(positions) == len(reference):
+            return None
+        return positions
+
     def evaluate_sequences(
         self,
         sequences: List[str],
         reference_sequence_or_sequences: Union[str, List[str]],
-        fixed_position_indices: List[int] = None,
-        sequence_length: int = None,
+        fixed_position_indices: Optional[List[int]] = None,
+        sequence_length: Optional[int] = None,
+        designable_chain_index: Optional[int] = None,
         **kwargs,
     ) -> pd.DataFrame:
 
         # Prepare the sequences
         df = pd.DataFrame({"sequence": sequences})
 
-        # Filter to only designable positions if enabled
-        if (
-            self.only_consider_designable
-            and fixed_position_indices is not None
-            and sequence_length is not None
-        ):
-            # Get designable positions (all positions not in fixed list)
-            designable_positions = [
-                i for i in range(sequence_length) if i not in fixed_position_indices
-            ]
+        # The chain layout and the fixed positions are the base variant's, so
+        # one reference is enough to decide which positions to compare.
+        first_reference = (
+            reference_sequence_or_sequences
+            if isinstance(reference_sequence_or_sequences, str)
+            else reference_sequence_or_sequences[0]
+        )
+        positions = self._positions_to_compare(
+            first_reference,
+            fixed_position_indices,
+            sequence_length,
+            designable_chain_index,
+        )
 
-            # Filter sequences to only designable positions
-            filtered_sequences = [
-                "".join([seq[i] for i in designable_positions]) for seq in sequences
-            ]
+        def keep_positions(sequence: str) -> str:
+            """Return only the positions being compared."""
+            if positions is None:
+                return sequence
+            return "".join(sequence[i] for i in positions if i < len(sequence))
 
-            # Filter reference sequence
-            if isinstance(reference_sequence_or_sequences, str):
-                filtered_reference = "".join(
-                    [reference_sequence_or_sequences[i] for i in designable_positions]
-                )
-            else:
-                # Handle list of reference sequences
-                filtered_reference = [
-                    "".join([ref[i] for i in designable_positions])
-                    for ref in reference_sequence_or_sequences
-                ]
+        filtered_sequences = [keep_positions(sequence) for sequence in sequences]
+        if isinstance(reference_sequence_or_sequences, str):
+            filtered_reference = keep_positions(reference_sequence_or_sequences)
         else:
-            # Use full sequences
-            filtered_sequences = sequences
-            filtered_reference = reference_sequence_or_sequences
+            filtered_reference = [
+                keep_positions(reference) for reference in reference_sequence_or_sequences
+            ]
 
         df["reference_sequence"] = filtered_reference
+        pairs = list(zip(filtered_sequences, df["reference_sequence"]))
 
-        # Evaluate the sequences
+        vectorised = vectorised_position_metrics(pairs, self.active_scores)
+
         for score in self.active_scores:
+            if score in vectorised:
+                df[score] = vectorised[score]
+                continue
             pairwise_metric_func = get_pairwise_metric(score)
-
-            results = get_pool().process(
-                pairwise_metric_func,
-                [
-                    (filtered_seq, ref)
-                    for filtered_seq, ref in zip(filtered_sequences, df["reference_sequence"])
-                ],
-                show_progress=True,
-            )
-
-            df[score] = results
+            df[score] = [
+                pairwise_metric_func(sequence, reference) for sequence, reference in pairs
+            ]
 
         df.drop(columns=["reference_sequence"], inplace=True)
 
@@ -492,38 +512,119 @@ class LocalizationPredictor(Evaluator):
             "localization_prob": {
                 "larger_is_better": True,
                 "min_value": 0,
-                "max_value": 1,
+                "max_value": 1, 
             }
         }
+
+    #: ESM2 checkpoint whose mean embeddings the bundled classifier was fit on.
+    #: Changing it invalidates the classifier, so it is not a config knob.
+    MODEL_CHECKPOINT = "esm2_t33_650M_UR50D"
 
     def __init__(
         self,
         seed: int = 42,
         active_scores: List[str] = None,
         use_cache: bool = True,
+        device: Optional[str] = None,
+        classifier_path: Optional[str] = None,
+        batch_size: int = 50,
     ):
-        super().__init__(seed=seed, active_scores=active_scores, use_cache=use_cache)
+        """
+        Initializes the localization predictor.
 
-        self.esm2_model = ESM2Model(model_name="esm2_t33_650M_UR50D")
+        Args:
+            seed: The seed to use for the evaluator.
+            active_scores: Which of this evaluator's scores to return.
+            use_cache: Whether to cache results by sequence hash.
+            device: Device string forwarded to the ESM2 tool.
+            classifier_path: Pickled scikit-learn classifier mapping an ESM2
+                mean embedding to a localization probability. Defaults to
+                ``DEFAULT_CLASSIFIER_PATH``, resolved relative to the repository
+                root rather than the working directory.
+            batch_size: Sequences per ESM2 forward pass.
+        """
+        super().__init__(
+            seed=seed,
+            active_scores=active_scores,
+            use_cache=use_cache,
+            device=device,
+        )
 
-        with open(os.path.join("inputs", "renin", "logreg_model.pkl"), "rb") as f:
+        self.batch_size = batch_size
+        self.classifier_path = Path(classifier_path or DEFAULT_CLASSIFIER_PATH)
+        if not self.classifier_path.is_file():
+            raise FileNotFoundError(
+                f"No localization classifier at {self.classifier_path}. Pass "
+                "classifier_path to point at one trained for your target."
+            )
+        with open(self.classifier_path, "rb") as f:
             self.predictor = pickle.load(f)
 
+    def get_extra_kwargs(self, base_variant):
+        """
+        LocalizationPredictor may require extracting the designable chain.
+        """
+        extra_kwargs = {}
+        # Check for single designable chain requirement if base variant is multichain
+        if base_variant.sequence and '/' in base_variant.sequence:
+             try:
+                 extra_kwargs["designable_chain_index"] = base_variant.designable_chain_index
+             except ValueError:
+                 pass
+        return extra_kwargs
+
     def evaluate_sequences(
-        self, sequences: List[str], device: str = device_manager.get_device(), **kwargs
+        self,
+        sequences: List[str],
+        designable_chain_index: Optional[int] = None,
+        **kwargs,
     ) -> pd.DataFrame:
+        """Score sequences by localization probability.
 
-        # Get embeddings
-        outputs = self.esm2_model(
-            sequences,
-            batch_size=50,
-            device=device,
-            return_logits=False,
-            progress_bar_msg="Running ESM2 localization predictor",
+        Embeddings come from proto-tools' ``esm2-embedding`` tool, which runs
+        ESM2 in its own environment; only the classifier runs in this process.
+
+        Args:
+            sequences: Sequences to score. A multi-chain sequence is joined by
+                ``/``, and the returned frame keys on the sequence as given.
+            designable_chain_index: Which ``/``-separated chain to embed. The
+                classifier was fitted on single-chain embeddings, so for a
+                multi-chain variant only the designable chain is passed to the
+                model. Supplied by ``get_extra_kwargs``.
+        """
+        from proto_tools.tools import (
+            ESM2EmbeddingsConfig,
+            ESM2EmbeddingsInput,
+            run_esm2_embeddings,
         )
-        embeddings = outputs["mean_embeddings"]
 
-        # Get predictions
+        sequences_to_eval = sequences
+        if designable_chain_index is not None:
+
+            def extract_chain(seq_str, idx):
+                parts = seq_str.split('/')
+                if idx >= len(parts):
+                    return seq_str
+                return parts[idx]
+
+            sequences_to_eval = [
+                extract_chain(s, designable_chain_index) for s in sequences
+            ]
+
+        config_kwargs = {
+            "model_checkpoint": self.MODEL_CHECKPOINT,
+            "batch_size": self.batch_size,
+            "return_logits": False,
+            "seed": self.seed,
+        }
+        config_kwargs["device"] = resolve_device(self.device)
+
+        outputs = run_esm2_embeddings(
+            ESM2EmbeddingsInput(sequences=sequences_to_eval),
+            ESM2EmbeddingsConfig(**config_kwargs),
+        )
+
+        embeddings = [result.mean_embedding for result in outputs.results]
         predictions = self.predictor.predict_proba(embeddings)
         return pd.DataFrame({"sequence": sequences, "localization_prob": predictions[:, 1]})
 
@@ -552,12 +653,18 @@ class DiscountedHammingDistance(Evaluator):
         self,
         seed: int = 42,
         active_scores: List[str] = None,
-        use_cache: bool = True,
+        use_cache: bool = False,
+        device: Optional[str] = None,
     ):
-        super().__init__(seed=seed, active_scores=active_scores, use_cache=use_cache)
+        super().__init__(
+            seed=seed,
+            active_scores=active_scores,
+            use_cache=use_cache,
+            device=device,
+        )
 
         self.localization_evaluator = get_evaluator(
-            "localization_predictor", seed=seed, use_cache=use_cache
+            "localization_predictor", seed=seed, use_cache=use_cache, device=device
         )
         self.normalized_hamming_distance_evaluator = get_evaluator(
             "sequence_similarity",
@@ -570,17 +677,41 @@ class DiscountedHammingDistance(Evaluator):
         """
         DiscountedHammingDistance requires a reference sequence for comparison.
         """
-        return {"reference_sequence_or_sequences": base_variant.sequence}
+        extra_kwargs = {
+            "reference_sequence_or_sequences": base_variant.sequence,
+        }
+        
+        # Check for single designable chain requirement if base variant is multichain
+        if base_variant.sequence and '/' in base_variant.sequence:
+             try:
+                 extra_kwargs["designable_chain_index"] = base_variant.designable_chain_index
+             except ValueError:
+                 pass
+                 
+        return extra_kwargs
 
     def evaluate_sequences(
         self,
         sequences: List[str],
         reference_sequence_or_sequences: Union[str, List[str]],
+        designable_chain_index: Optional[int] = None,
         **kwargs,
     ) -> pd.DataFrame:
 
+        # Filter sequences for localization_predictor if designable chain index is provided
+        sequences_for_loc = sequences
+        if designable_chain_index is not None:
+             # Extract the designable chain
+            def extract_chain(seq_str, idx):
+                parts = seq_str.split('/')
+                if idx >= len(parts):
+                    return seq_str
+                return parts[idx]
+
+            sequences_for_loc = [extract_chain(s, designable_chain_index) for s in sequences]
+
         # Get localization predictions
-        localization_probabilities = self.localization_evaluator.evaluate_sequences(sequences)[
+        localization_probabilities = self.localization_evaluator.evaluate_sequences(sequences_for_loc)[
             "localization_prob"
         ].values
 
@@ -588,6 +719,8 @@ class DiscountedHammingDistance(Evaluator):
             self.normalized_hamming_distance_evaluator.evaluate_sequences(
                 sequences=sequences,
                 reference_sequence_or_sequences=reference_sequence_or_sequences,
+                designable_chain_index=designable_chain_index,
+                **kwargs,
             )["normalized_hamming_distance"].values
         )
 
@@ -610,63 +743,49 @@ class StructureMetrics(Evaluator):
     Returns protein quality scores from predicted structures
     """
 
-    def __init__(
-        self,
-        seed: int = 42,
-        active_scores: List[str] = None,
-    ):
-        super().__init__(seed=seed, active_scores=active_scores)
-
-        self.esm3_model = ESM3Model()
-
     def evaluate_sequences(
         self,
         sequences: List[str],
-        device: str = device_manager.get_device(),
+        device: Optional[str] = None,
         **kwargs,
     ) -> pd.DataFrame:
 
-        # Predict structures
-        structure_predictions = self.esm3_model.predict_structure(
-            sequences=sequences, device=device
+        pdb_strings, plddts, ptms = dispatch_structure_predictions(
+            sequences, device if device is not None else self.device
         )
 
-        # Create DataFrame
-        df = pd.DataFrame(structure_predictions)
-        df = df.rename(columns={"avg_plddt": "esm3_avg_plddt", "ptm": "esm3_ptm"})
-
-        # Get the sequence lengths
-        seq_len = len(df["sequence"].iloc[0])
-
-        # Use the pool
-        logger.debug("Computing structure-based scores in parallel")
-        results = get_pool().process(
-            calculate_structure_scores,
-            [(row["pdb_string"], self.active_scores, seq_len) for _, row in df.iterrows()],
+        df = pd.DataFrame(
+            {
+                "sequence": sequences,
+                "esmfold2_avg_plddt": plddts,
+                "esmfold2_ptm": ptms,
+            }
         )
-        scores_df = pd.DataFrame(results)
 
-        # Combine with original DataFrame
-        df = pd.concat([df, scores_df], axis=1)
-        df.drop(columns=["pdb_string"], inplace=True)
+        # Scores are reported per residue, so a longer design is not penalised
+        # for its length alone.
+        seq_len = len(sequences[0])
+
+        if "sap_score" in self.active_scores:
+            df["sap_score"] = dispatch_sap_scores(pdb_strings)
+
+        if "rosetta_energy_score" in self.active_scores:
+            df["rosetta_energy_score"] = [
+                energy / seq_len for energy in dispatch_rosetta_energy_scores(pdb_strings)
+            ]
 
         return df
 
     @classmethod
     def available_scores(cls) -> Dict[str, Dict[str, Any]]:
         return {
-            "esm3_avg_plddt": {
+            "esmfold2_avg_plddt": {
                 "larger_is_better": True,
                 "min_value": 0,
                 "max_value": 1,
             },
-            "esm3_ptm": {"larger_is_better": True, "min_value": 0, "max_value": 1},
+            "esmfold2_ptm": {"larger_is_better": True, "min_value": 0, "max_value": 1},
             "sap_score": {
-                "larger_is_better": False,
-                "min_value": None,  # 0 is minimum, but practically will be higher
-                "max_value": None,
-            },
-            "sasa_score": {
                 "larger_is_better": False,
                 "min_value": None,  # 0 is minimum, but practically will be higher
                 "max_value": None,
@@ -678,114 +797,175 @@ class StructureMetrics(Evaluator):
             },
         }
 
-    @staticmethod
-    def worker_init():
-        # Added locking for PyRosetta so processes don't conflict with each other
-        lock_file_path = pathlib.Path(__file__).parent / "locks" / "StructureMetrics.lock"
-        try:
-            with lock_via_lockfile(lock_file_path, timeout=200):
-                import pyrosetta
-
-                pyrosetta.init("-mute all")
-                from pyrosetta.rosetta.core.import_pose import pose_from_pdbstring
-                from pyrosetta import get_fa_scorefxn
-                from pyrosetta.rosetta.core.pack.guidance_scoreterms import (
-                    sap as sap_terms,
-                )
-
-                return {
-                    "pyrosetta": pyrosetta,
-                    "pose_from_pdbstring": pose_from_pdbstring,
-                    "get_fa_scorefxn": get_fa_scorefxn,
-                    "sap_terms": sap_terms,
-                    "success": True,
-                }
-        except Exception as e:
-            return {"message": str(e), "success": False}
-
 
 # ==============================
 # Structure metrics
 # ==============================
-def pose_from_string(pdb_str: str, pyrosetta_module, pose_from_pdbstring_func):
-    pose = pyrosetta_module.Pose()
-    pose_from_pdbstring_func(pose, pdb_str)  # in-place fill
-    pose.update_residue_neighbors()
-    return pose
-
-
-def calculate_structure_scores(
-    pdb_string: str, active_scores: List[str], sequence_length: int
-) -> dict:
+def dispatch_sap_scores(pdb_strings: List[str]) -> List[float]:
     """
-    Calculates the structure scores for a given PDB string.
-    """
-    ctx = getattr(_worker_local, "ctx", {})
-
-    pose = pose_from_string(pdb_string, ctx["pyrosetta"], ctx["pose_from_pdbstring"])
-    scores = {}
-    if "sap_score" in active_scores:
-        scores["sap_score"] = calculate_sap_score(pose, ctx["sap_terms"])
-    if "sasa_score" in active_scores:
-        scores["sasa_score"] = calculate_sasa_score(pdb_string) / sequence_length
-    if "rosetta_energy_score" in active_scores:
-        scores["rosetta_energy_score"] = (
-            calculate_rosetta_energy_score(pose, ctx["get_fa_scorefxn"]) / sequence_length
-        )
-    return scores
-
-
-def calculate_sap_score(pose, sap_terms) -> float:
-    """
-    Calculates the SAP score for a given PDB string. SAP (Spatial Aggregation
+    Calculates the SAP score for each PDB string. SAP (Spatial Aggregation
     Propensity) is a measure of the propensity of a protein to aggregate. The
     raw SAP score is a non-negative number where higher values indicate more
     aggregation.
 
+    This is ProVADA's measure of exposed hydrophobicity. It weights each
+    residue's sidechain exposure by its hydrophobicity and sums over a spatial
+    neighbourhood, so it scores hydrophobic *patches* rather than total apolar
+    area. Two designs can expose the same area and aggregate very differently
+    depending on whether that area is clustered, which a scalar area cannot
+    distinguish. ``pyrosetta-sasa`` reports hydrophobic area if the raw
+    quantity is ever wanted alongside this.
+
     Args:
-        pose: The PyRosetta pose to calculate the SAP score for
-        sap_terms: The PyRosetta SAP terms to use
+        pdb_strings: The PDB strings to score
 
     Returns:
-        The SAP score for the given PDB string
+        One SAP score per input, in input order
     """
-    sm = sap_terms.SapScoreMetric()
-    return float(sm.calculate(pose))
+    from proto_tools.tools import (
+        PyRosettaSAPConfig,
+        PyRosettaSAPInput,
+        run_pyrosetta_sap,
+    )
+
+    output = run_pyrosetta_sap(
+        PyRosettaSAPInput(inputs=list(pdb_strings)), PyRosettaSAPConfig()
+    )
+    return [float(result.sap_score) for result in output.results]
 
 
-def calculate_sasa_score(pdb_string: str) -> float:
+#: Scores that are a straight position-by-position comparison, so a whole batch
+#: of equal-length pairs is one array comparison rather than one call each.
+POSITION_WISE_METRICS = frozenset({"sequence_identity", "normalized_hamming_distance"})
+
+
+def vectorised_position_metrics(
+    pairs: List[Tuple[str, str]], active_scores: List[str]
+) -> Dict[str, List[float]]:
     """
-    Calculates the SASA score for a given PDB string. SASA (Solvent Accessible
-    Surface Area) is a measure of the total area of a protein that is accessible
-    to a solvent probe. The raw SASA score is a non-negative number where higher
-    values indicate more accessible surface area. For monomer stability, lower
-    exposed hydrophic SASA is better.
+    Computes the position-wise similarity scores for a whole batch at once.
+
+    ``sequence_identity`` and ``normalized_hamming_distance`` both reduce to a
+    count of matching positions when the two sequences are the same length,
+    which is the case for a population of designs against one reference. That
+    makes the batch a single NumPy comparison instead of one Python call per
+    pair.
+
+    Each score is derived from the match count independently. Deriving the
+    Hamming distance as ``1 - identity`` instead would disagree with the
+    per-pair implementation in the last bit for most lengths, because the two
+    expressions round differently.
 
     Args:
-        pdb_string: The PDB string to calculate the SASA score for
-    """
-    # Parse the PDB string
-    struct = PDBParser(QUIET=True).get_structure("X", io.StringIO(pdb_string))
-    result, _atom_areas = freesasa.calcBioPDB(struct)
-
-    return float(result.totalArea())
-
-
-def calculate_rosetta_energy_score(pose, get_fa_scorefxn_func) -> float:
-    """
-    Calculates the Rosetta energy score for a given PDB string. The Rosetta total
-    energy score is a negative number where lower values (more negative) indicate
-    more stable structures.
-
-    Args:
-        pdb_string: The PDB string to calculate the Rosetta energy score for
+        pairs: ``(sequence, reference)`` pairs, already filtered to the
+            positions being compared
+        active_scores: Scores the evaluator was asked for
 
     Returns:
-        The rosetta energy score for the given PDB string
+        One list of scores per position-wise metric that was requested, empty
+        when the batch is ragged or nothing applies
     """
-    scorefxn = get_fa_scorefxn_func()  # standard full-atom score function
-    total = scorefxn(pose)  # evaluates and caches energies on the pose
-    return float(total)
+    wanted = POSITION_WISE_METRICS & set(active_scores)
+    if not wanted or not pairs:
+        return {}
+
+    # The comparison needs one common width; anything else falls back to the
+    # per-pair functions, which align before scoring.
+    lengths = {len(sequence) for pair in pairs for sequence in pair}
+    if len(lengths) != 1:
+        return {}
+    (length,) = lengths
+    if length == 0:
+        return {}
+
+    sequences = np.frombuffer("".join(pair[0] for pair in pairs).encode(), dtype=np.uint8)
+    references = np.frombuffer("".join(pair[1] for pair in pairs).encode(), dtype=np.uint8)
+    if sequences.size != len(pairs) * length:
+        # A non-ASCII residue code makes the byte count disagree with the
+        # character count, so the reshape below would silently misalign.
+        return {}
+    matches = (
+        (sequences.reshape(len(pairs), length) == references.reshape(len(pairs), length))
+        .sum(axis=1)
+        .tolist()
+    )
+
+    results = {}
+    if "sequence_identity" in wanted:
+        results["sequence_identity"] = [count / length for count in matches]
+    if "normalized_hamming_distance" in wanted:
+        results["normalized_hamming_distance"] = [
+            (length - count) / length for count in matches
+        ]
+    return results
+
+
+def dispatch_structure_predictions(
+    sequences: List[str], device: Optional[str]
+) -> Tuple[List[str], List[float], List[float]]:
+    """
+    Predicts a structure for each sequence with ESMFold2.
+
+    Args:
+        sequences: Sequences to fold, chains split by '/'
+        device: Device to fold on, or None for the tool's default
+
+    Returns:
+        PDB content, mean pLDDT and pTM, one of each per input, in input order
+    """
+    from proto_tools.entities.complex import Chain, Complex
+    from proto_tools.tools import ESMFold2Config, ESMFold2Input, run_esmfold2
+
+    complexes = [
+        Complex(
+            chains=[
+                Chain(sequence=chain, entity_type="protein")
+                for chain in sequence.split("/")
+            ]
+        )
+        for sequence in sequences
+    ]
+
+    config_kwargs = {"device": resolve_device(device)}
+    output = run_esmfold2(
+        ESMFold2Input(complexes=complexes), ESMFold2Config(**config_kwargs)
+    )
+
+    pdb_strings, plddts, ptms = [], [], []
+    for structure in output.structures:
+        pdb_content, _chain_map = structure.to_pdb_with_chain_mapping()
+        pdb_strings.append(pdb_content)
+        plddts.append(float(structure.metrics.plddt))
+        ptms.append(float(structure.metrics.ptm))
+    return pdb_strings, plddts, ptms
+
+
+def dispatch_rosetta_energy_scores(pdb_strings: List[str]) -> List[float]:
+    """
+    Calculates the total Rosetta energy for each PDB string. The score is a
+    negative number where lower values (more negative) indicate more stable
+    structures.
+
+    Scored with ``ref2015``, the score function ``get_fa_scorefxn()`` returns by
+    default.
+
+    Args:
+        pdb_strings: The PDB strings to score
+
+    Returns:
+        One total energy, in REU, per input, in input order
+    """
+    from proto_tools.tools import (
+        PyRosettaEnergyConfig,
+        PyRosettaEnergyInput,
+        run_pyrosetta_energy,
+    )
+
+    output = run_pyrosetta_energy(
+        PyRosettaEnergyInput(inputs=list(pdb_strings)),
+        PyRosettaEnergyConfig(scorefxn="ref2015"),
+    )
+    return [float(result.total_energy) for result in output.results]
 
 
 # ==============================
@@ -831,3 +1011,235 @@ def list_all_score_keys() -> List[str]:
             ]
         )
     )
+
+
+# ==============================
+# immunogenicity evaluator
+# ==============================
+
+@EVALUATOR_REGISTRY.register("Immunogenicity")
+class ImmunogenicityMetrics(Evaluator):
+    """
+    Returns immunogenicity metrics from netMHCpan predictions
+    """
+    @classmethod
+    def available_scores(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "immunogenicity_score": {
+                "larger_is_better": False,
+                "min_value": 0,
+                "max_value": 100,
+            },
+            "allele_averaged_positive_pep_ratio": {
+                "larger_is_better": False,
+                "min_value": 0,
+                "max_value": 1,
+            }
+        }
+
+    def __init__(
+        self,
+        seed: int = 42,
+        active_scores: List[str] = None,
+        device: Optional[str] = None,
+    ):
+        # Accepted and stored for interface symmetry; netMHCpan is a CPU binary,
+        # so this evaluator never dispatches to a device.
+        super().__init__(seed=seed, active_scores=active_scores, device=device)
+
+
+    def evaluate_sequences(
+        self, sequences: List[str], **kwargs
+    ) -> pd.DataFrame:
+
+        mhc_alleles = kwargs.get("mhc_alleles", None)
+
+        self_peptide_db = kwargs.get("self_peptide_db", None)
+
+        if mhc_alleles is None or len(mhc_alleles) == 0:
+            raise ValueError("MHC alleles list cannot be empty for immunogenicity scoring.")
+
+        scans = dispatch_epitope_scans(sequences, mhc_alleles)
+
+        df = pd.DataFrame({"sequence": sequences})
+        rows = [
+            score_epitope_scan(scan, len(mhc_alleles), self_peptide_db) for scan in scans
+        ]
+        scores_df = pd.DataFrame(rows)
+
+        columns_to_keep = [
+            score
+            for score in ("immunogenicity_score", "allele_averaged_positive_pep_ratio")
+            if score in self.active_scores
+        ]
+
+        return pd.concat([df, scores_df[columns_to_keep]], axis=1)
+
+    def get_extra_kwargs(self, base_variant):
+        """
+        Immunogenicity metrics requires additional MHC alleles and optional self peptide database.
+        """
+        return {
+            "mhc_alleles": base_variant.mhc_alleles,
+            "self_peptide_db": base_variant.self_peptide_db if hasattr(base_variant, "self_peptide_db") else None,
+        }
+
+# scoring function
+#: Peptide length ProVADA scans. Class I epitopes are 8-11mers; this scores 9mers
+#: only, which is what the published runs used.
+PEPTIDE_LENGTH = 9
+
+
+def dispatch_epitope_scans(sequences: List[str], alleles: List[str]) -> List[Any]:
+    """
+    Predicts MHC class I binding for every window of every sequence.
+
+    Args:
+        sequences: Protein sequences to scan
+        alleles: MHC alleles to predict against, in any accepted spelling
+
+    Returns:
+        One scan per input sequence, in input order, each carrying every
+        peptide-by-allele prediction
+    """
+    from proto_tools.tools import (
+        NetMHCpanProteinConfig,
+        NetMHCpanProteinInput,
+        run_netmhcpan_protein,
+    )
+
+    output = run_netmhcpan_protein(
+        NetMHCpanProteinInput(sequences=list(sequences)),
+        NetMHCpanProteinConfig(
+            alleles=list(alleles),
+            peptide_lengths=[PEPTIDE_LENGTH],
+            # Scoring reads the binding-affinity rank, which -BA adds alongside
+            # the eluted-ligand columns rather than replacing them.
+            include_binding_affinity=True,
+        ),
+    )
+    return output.results
+
+
+def score_epitope_scan(
+    scan: Any,
+    num_alleles: int,
+    self_peptide_db: Optional[set] = None,
+    threshold_rank: float = 10.0,
+    k: float = 0.5,
+) -> Dict[str, float]:
+    """
+    Reduces one protein's predictions to ProVADA's two immunogenicity scores.
+
+    Each peptide-allele pair contributes a logistic score in the binding-affinity
+    rank. A peptide already present in the self-peptide database is dropped from
+    both aggregates, since a presented self peptide is tolerated.
+
+    Args:
+        scan: One protein's predictions, from ``dispatch_epitope_scans``
+        num_alleles: Size of the allele panel, which both scores average over
+        self_peptide_db: Peptides to treat as self, or None to count every peptide
+        threshold_rank: Rank at the logistic's midpoint, and the positive cutoff
+        k: Steepness of the logistic
+
+    Returns:
+        ``immunogenicity_score`` and ``allele_averaged_positive_pep_ratio``
+    """
+    scores = []
+    positive_peptide_count = 0
+
+    for binding in scan.bindings:
+        rank = binding.rank_ba
+        score = logistic_map_rank_to_score(rank, k=k, x0=threshold_rank)
+        # Only check the self database for peptides that would otherwise score.
+        if (self_peptide_db is not None) and (score > 0.05):
+            if find_endogenous_peptide(binding.peptide, self_peptide_db):
+                continue
+        scores.append(score)
+        if rank <= threshold_rank:
+            positive_peptide_count += 1
+
+    return {
+        "immunogenicity_score": sum(scores) / num_alleles,
+        "allele_averaged_positive_pep_ratio": (
+            positive_peptide_count / num_alleles / scan.sequence_length
+        ),
+    }
+
+
+# netmhcpan helpers
+# score mapping, map rank (0-100) to score (1-0)
+def logistic_map_rank_to_score(rank: float, k: float = 0.5, x0: float = 10.0) -> float:
+    """
+    Map a rank (0-100) to a score (0-1) using a logistic function.
+    k: steepness of the curve
+    x0: the rank value of the sigmoid's midpoint
+    """
+    import math
+    if rank < 0 or rank > 100:
+        raise ValueError("Rank must be between 0 and 100.")
+    score =  1- 1 / (1 + math.exp(-k * (rank - x0)))
+    return score
+
+
+
+
+
+def find_endogenous_peptide(peptide, endogenous_peptides_set: set) -> pd.DataFrame:
+    """
+    find if a peptide is in the endogenous peptides set
+    """
+    return peptide in endogenous_peptides_set
+
+
+
+# ==============================
+# Generator Score Evaluators
+# ==============================
+
+class GeneratorEvaluator(Evaluator):
+    """
+    Base class for evaluators that extract scores from the input dataframe
+    provided by the generator.
+    """
+    def evaluate(self, sequences: Union[List[str], pd.DataFrame], **kwargs) -> pd.DataFrame:
+        if isinstance(sequences, list):
+            logger.warning(f"{self.__class__.__name__} received list of sequences. Cannot extract generator scores.")
+            return pd.DataFrame({score: [float('nan')] * len(sequences) for score in self.active_scores})
+
+        # Return a dataframe with just the requested scores
+        result = pd.DataFrame(index=sequences.index)
+        for score in self.active_scores:
+            if score in sequences.columns:
+                result[score] = sequences[score]
+            else:
+                result[score] = float('nan')
+        return result
+        
+    def evaluate_sequences(self, sequences: List[str], **kwargs) -> pd.DataFrame:
+        raise NotImplementedError("GeneratorEvaluator should not call evaluate_sequences")
+
+
+@EVALUATOR_REGISTRY.register("caliby_energy_score")
+class CalibyGeneratorEvaluator(GeneratorEvaluator):
+    @classmethod
+    def available_scores(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "caliby_energy_score": {
+                "larger_is_better": False, 
+                "min_value": -1000,
+                "max_value": 0
+            }
+        }
+
+@EVALUATOR_REGISTRY.register("mpnn_score")
+class MPNNGeneratorEvaluator(GeneratorEvaluator):
+    @classmethod
+    def available_scores(cls) -> Dict[str, Dict[str, Any]]:
+        return {
+            "mpnn_score": {
+                "larger_is_better": False, 
+                "min_value": 0,
+                "max_value": 3
+            }
+        }

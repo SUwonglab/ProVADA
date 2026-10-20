@@ -1,0 +1,42 @@
+# fmc63 deimmune Config File
+seed: 415
+wandb_project: provada_deimmunization_fmc63_batch
+
+base_variant:
+  sequence_file_path: inputs/fmc63/fmc63_seq.txt
+  fixed_position_files:
+    - inputs/fmc63/fmc63_fixed_residues.txt
+  structure_file_path: inputs/fmc63/fold_fmc63_monomer_model_0.cif
+  # Immunogenicity parameters. Quoted because the allele names contain '*'.
+  mhc_alleles: "HLA-A*02:01, HLA-B*07:02"
+  exclude_self_peptides: true
+
+sampler:
+  sampler_type: mada
+  greedy: true
+  num_iters: 200
+  population_size: 50
+  top_k_fraction: 0.2
+  normalize: false
+  score_weights:
+    immunogenicity_score: 1
+    sequence_similarity: 0
+    normalized_hamming_distance: 0
+    mpnn_score: 0.1
+
+generator:
+  generator_type: mpnn
+  generations_per_sequence: 1
+  temperature: 0.3
+
+masking_schedule:
+  schedule_type: power
+  alpha: 0.5
+  start_value: 0.1
+  stop_value: 0.01
+
+temperature_schedule:
+  schedule_type: power
+  alpha: 2
+  start_value: 0.04
+  stop_value: 0.01
