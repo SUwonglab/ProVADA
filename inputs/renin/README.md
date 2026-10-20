@@ -1,45 +1,50 @@
-# Renin Example Input
+# Renin Localization Example
 
-This is the example input mentioned in the original ProVADA preprint:
-[https://www.biorxiv.org/content/10.1101/2025.07.11.664238v1](https://www.biorxiv.org/content/10.1101/2025.07.11.664238v1)
+This example uses ProVADA to redesign human renin for activity in the cytosol.
+ProteinMPNN proposes variants, and a localization classifier scores their
+predicted compatibility with the cytosolic environment.
 
-## Example Commands
+<div align="center">
 
-To run ProVADA with this example input, use the following commands:
+<img src="./renin_design_positions.png" alt="Renin design positions" width="520"/>
+
+<sub><i>Designable residues are shown in teal and fixed residues in grey. Of the 340 residues, 244 are designable.</i></sub>
+
+</div>
+
+## Run the Example
+
+From the repository root:
+
 ```bash
 python run_provada.py --config inputs/renin/renin_localization_mpnn.yaml
 ```
-or
-```bash
-python run_provada.py --config inputs/renin/renin_localization_esm3.yaml
-```
 
-## What is Renin?
+## Design Setup
 
-Renin is a highly specific secreted aspartic protease that functions within the extracellular space as a central regulator of the renin–angiotensin system. Its physiological role is to cleave the plasma protein angiotensinogen with exceptional precision, initiating a tightly controlled proteolytic cascade that regulates blood pressure and electrolyte balance. This unusually narrow substrate specificity has made renin an attractive candidate for repurposing as a programmable protease capable of precisely controlling protein activity through targeted cleavage.
+Renin is a secreted aspartic protease that cleaves angiotensinogen. Adapting it
+to the reducing cytosol requires changes to its sequence while retaining the
+catalytic machinery.
 
-A fundamental challenge in repurposing renin for intracellular applications is that it evolved to function within the secretory pathway and extracellular milieu. When expressed in the cytoplasm, renin fails to adopt a functional protease conformation and exhibits no detectable cytosolic activity. This loss of function reflects the stark physicochemical differences between extracellular and cytoplasmic environments. These compartments differ substantially in redox potential, pH, ionic strength, and protein quality-control mechanisms, all of which strongly influence protein folding, stability, and catalytic competence.
+The configuration fixes 96 of 340 residues, including conserved positions and
+residues near the substrate-binding site. The remaining 244 positions are
+designable. The objective combines predicted cytosolic localization probability
+with penalties for sequence divergence and the ProteinMPNN score, with weights
+of 1.0, 0.2, and 0.1, respectively.
 
-Extracellular proteases such as renin typically contain structural features optimized for secretion and extracellular stability, including multiple disulfide bonds and N-glycosylation sites. While glycosylation is not strictly required for renin’s catalytic activity, both disulfide bonding and post-translational modifications contribute to its proper folding, stability, and trafficking in oxidizing environments. In the reducing cytoplasm, disulfide bonds cannot form reliably and may actively destabilize the protein, while glycosylation is absent, collectively rendering the native renin scaffold incompatible with cytosolic function.
+The run uses 300 iterations, a population of 30, and a ProteinMPNN sampling
+temperature of 0.5. New cysteines are excluded. The paper's renin campaign also
+used an ESM-2 pseudo-perplexity penalty; that term is not included in this
+example.
 
-What makes engineering a cytosol-compatible renin particularly challenging—and therefore a compelling test case for ProVADA—is the lack of evolutionary precedents. There are no known close homologs of renin or related aspartic proteases that are naturally adapted to function in the reducing cytosolic environment. As a result, there are no existing biological templates from which to directly infer design solutions. Starting from a scaffold with no detectable cytosolic activity, traditional directed evolution approaches would require prohibitively large libraries and expensive, low-throughput live-cell assays in mammalian systems.
+## Files
 
-ProVADA addresses this challenge by integrating generative protein models with a specialized fitness oracle that evaluates cytosolic localization compatibility. Rather than relying on random mutagenesis, ProVADA systematically removes extracellular signatures—such as disulfide-forming cysteines and glycosylation motifs—while preserving renin’s core catalytic machinery and overall structural fold. This approach enables the efficient proposal of cytosolic-compatible renin variants in silico, achieving a 9.5-fold improvement in sampling efficiency relative to conventional rejection-sampling strategies, without requiring iterative experimental screening.
-
-## Files in this Directory
-
-- **example_seq_renin.txt** - The wild-type human renin catalytic domain sequence (340 amino acids). This is the starting point for ProVADA's engineering efforts, with a native cytosolic localization probability of only 0.035
-
-- **renin_af3.pdb** - AlphaFold 3 predicted structure of the renin catalytic domain. This structure is used to guide ProteinMPNN generation and ensure structural constraints are maintained during variant design
-
-- **logreg_model.pkl** - Pre-trained logistic regression classifier that predicts cytosolic localization probability. Trained on ESM2 embeddings from a curated dataset of vertebrate proteins, this model serves as the fitness oracle that guides ProVADA toward cytosolic-compatible variants
-
-- **train_localization_classifier.py** - Python script for training the cytosolic localization classifier. Loads UniProt subcellular localization data, embeds sequences using ESM2, and trains an L2-regularized logistic regression model
-
-- **conserved_positions.txt** - List of sequence positions (1-indexed) that must remain fixed during variant generation. These correspond to the catalytic aspartate residues (D38, D226) and other critical positions essential for maintaining aspartic protease activity
-
-- **interface_positions.txt** - List of positions (1-indexed) corresponding to substrate-contacting and active-site residues. Fixing these positions helps preserve renin's substrate specificity, though many are located in the active-site flap region (residues 80-90) which shows high variability in ProVADA outputs
-
-- **renin_localization_mpnn.yaml** - ProVADA configuration file using ProteinMPNN as the sequence generator. Specifies MADA sampler parameters, temperature and masking schedules, and score weights balancing localization probability against sequence divergence.
-
-- **renin_localization_esm3.yaml** - ProVADA configuration file using ESM3 as the sequence generator. Uses a larger population size (200) compared to the ProteinMPNN configuration, with adjusted masking and temperature schedules optimized for ESM3's generation characteristics
+| File | Description |
+| --- | --- |
+| [example_seq_renin.txt](./example_seq_renin.txt) | Reference human renin catalytic-domain sequence, 340 residues. |
+| [renin_af3.pdb](./renin_af3.pdb) | AlphaFold 3 structure used to condition ProteinMPNN. |
+| [logreg_model.pkl](./logreg_model.pkl) | Trained logistic regression classifier that predicts cytosolic localization probability from ESM-2 embeddings. |
+| [train_localization_classifier.py](./train_localization_classifier.py) | Script for training the classifier on UniProt subcellular localization data. |
+| [conserved_positions.txt](./conserved_positions.txt) | Six fixed positions identified from the ConSurf multiple sequence alignment, excluding cysteines. Positions are 1-indexed. |
+| [interface_positions.txt](./interface_positions.txt) | 92 fixed positions with a heavy atom within 8 Å of the substrate segment in the predicted complex, including the two catalytic residues. Positions 129 and 316 also occur in the conserved set. |
+| [renin_localization_mpnn.yaml](./renin_localization_mpnn.yaml) | Configuration for this example. |

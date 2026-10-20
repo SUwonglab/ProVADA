@@ -18,6 +18,8 @@ def amino_acid_sequence_check(
     """
 
     AMINO_ACIDS_SET = set(AMINO_ACIDS)
+    # Allow chain separator
+    AMINO_ACIDS_SET.add("/")
 
     # If we are allowing unknown amino acids, add to the set
     if allow_unknown:

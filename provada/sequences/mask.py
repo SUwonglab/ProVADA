@@ -71,13 +71,32 @@ def mask_p(
     # Determine how many positions are designable
     num_designable_positions = len(sequence) - len(fixed_indices)
 
-    # Determine the number of positions to mask
-    k = max(1, int(p * num_designable_positions))
-
     # Mask the sequence
-    masked_sequence = mask_k(sequence, k, mask_str, fixed_indices)
+    masked_sequence = mask_k(
+        sequence,
+        number_of_masked_positions(p, num_designable_positions),
+        mask_str,
+        fixed_indices,
+    )
 
     return masked_sequence
+
+
+def number_of_masked_positions(p: float, num_designable_positions: int) -> int:
+    """
+    How many positions a fraction masks, which is never fewer than one.
+
+    A fraction small enough to round down to nothing would leave a prompt with
+    nothing to design, so the floor is one position.
+
+    Args:
+        p (float): The fraction of designable positions to mask.
+        num_designable_positions (int): Positions available to mask.
+
+    Returns:
+        int: The number of positions to mask.
+    """
+    return max(1, int(p * num_designable_positions))
 
 
 def mask_assigned_positions(sequence: str, inds_to_mask: list[int], mask_str: str = "_") -> str:

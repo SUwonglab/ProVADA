@@ -11,17 +11,11 @@ from analyze.loading import (
     merge_scores_into_trajectory,
 )
 
-from analyze.plotting import (
-    show_trajectory_plot,
-    create_trajectory_animation,
-    create_multi_trajectory_animation,
-)
+from analyze.plotting import show_trajectory_plot
 
 __all__ = [
     "load_run_data",
     "bin_by_iteration",
     "merge_scores_into_trajectory",
     "show_trajectory_plot",
-    "create_trajectory_animation",
-    "create_multi_trajectory_animation",
 ]

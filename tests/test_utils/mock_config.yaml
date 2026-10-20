@@ -1,18 +1,30 @@
-# mock_config.yaml
-dataset:
-  dataset_name: gfp # Name of the dataset to load in
+# Minimal valid ProVADA config, used as a fixture for config-loading tests.
+seed: 7
+no_wandb: true
+wandb_project: provada_mock
 
-attributes:
-  list:
-    - attr1
-    - attr2
-    - attr3
-  str: "value"
-  int: 1
-  float: 1.0
-  bool: true
-  none: null
-  dict:
-    attr1: value1
-    attr2: value2
-    attr3: value3
+base_variant:
+  sequence_file_path: inputs/renin/example_seq_renin.txt
+
+sampler:
+  sampler_type: mada
+  num_iters: 11
+  population_size: 3
+  top_k_fraction: 0.5
+  score_weights:
+    dummy_score: 1.0
+
+generator:
+  generator_type: random
+  codon_scheme: NNN
+
+masking_schedule:
+  schedule_type: linear
+  start_value: 0.2
+  stop_value: 0.05
+
+temperature_schedule:
+  schedule_type: power
+  alpha: 2.0
+  start_value: 1.0
+  stop_value: 0.1

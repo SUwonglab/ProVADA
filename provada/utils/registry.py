@@ -103,7 +103,6 @@ class ComponentClassRegistry:
 
 # Create registries for different component types
 GENERATOR_REGISTRY = ComponentClassRegistry()
-MASK_STRATEGY_REGISTRY = ComponentClassRegistry()
 EVALUATOR_REGISTRY = ComponentClassRegistry()
 SCHEDULER_REGISTRY = ComponentClassRegistry()
 SAMPLER_REGISTRY = ComponentClassRegistry()

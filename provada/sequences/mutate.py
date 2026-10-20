@@ -5,7 +5,6 @@ Contains functions for applying mutations to string sequences
 """
 
 import random
-from itertools import combinations, product
 from Bio.Data.CodonTable import unambiguous_dna_by_name
 from Bio.Data import IUPACData
 import itertools
@@ -100,39 +99,6 @@ def mutate_p(
     mutated_sequence = mutate_k(sequence, k, codon_scheme, fixed_indices)
 
     return mutated_sequence
-
-
-def get_all_variants_at_mutational_distance_k(sequence: str, k: int) -> list[str]:
-    """
-    Returns all possible variants of a sequence at a given mutational distance k.
-    Only substitutions are considered (no insertions or deletions), and positions
-    are mutated simultaneously (i.e., exactly k positions are changed).
-
-    Args:
-        sequence: The original sequence to mutate.
-        k: The mutational (Hamming) distance.
-
-    Returns:
-        A list of all possible variants of the sequence at the given mutational distance k.
-    """
-    if k > len(sequence):
-        raise ValueError(
-            f"Requested number of mutations ({k}) is greater than the length of the sequence ({len(sequence)})"
-        )
-
-    variants = set()
-    for idx_combo in combinations(range(len(sequence)), k):
-        # For each combination of positions, create all combinations of replacement characters
-        for replacements in product(AMINO_ACIDS, repeat=k):
-            # Skip cases where all replacements are the same as the original sequence
-            if all(sequence[i] == r for i, r in zip(idx_combo, replacements)):
-                continue
-            mutated = list(sequence)
-            for i, r in zip(idx_combo, replacements):
-                mutated[i] = r
-            variants.add("".join(mutated))
-
-    return list(variants)
 
 
 # ===============================

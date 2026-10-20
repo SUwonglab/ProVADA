@@ -2,7 +2,11 @@ from sklearn.linear_model import LogisticRegression
 from datasets import load_dataset, DownloadMode
 import numpy as np
 from sklearn.metrics import classification_report
-from provada.models.esm2 import ESM2Model
+from proto_tools.tools import (
+    ESM2EmbeddingsConfig,
+    ESM2EmbeddingsInput,
+    run_esm2_embeddings,
+)
 import pickle
 from provada.utils.setup import seed_everything
 import os
@@ -28,20 +32,19 @@ for split in dataset.keys():
 # Concatenate the dataframes
 df = pd.concat(dfs)
 
-# Load the ESM2 model
-esm2_model = ESM2Model(model_name="esm2_t33_650M_UR50D")
-
-
-# Embed all the sequences
-outputs = esm2_model(
-    df["sequence"].tolist(),
-    batch_size=80,
-    keep_on_device=False,
-    return_logits=False,
-    device="cuda",
+# Embed all the sequences. ESM2 runs in proto-tools' own environment; the
+# checkpoint must match LocalizationPredictor.MODEL_CHECKPOINT, since the
+# classifier fitted below is only valid for that embedding space.
+outputs = run_esm2_embeddings(
+    ESM2EmbeddingsInput(sequences=df["sequence"].tolist()),
+    ESM2EmbeddingsConfig(
+        model_checkpoint="esm2_t33_650M_UR50D",
+        batch_size=80,
+        return_logits=False,
+        device="cuda",
+    ),
 )
-# Pull the mean embeddings
-mean_embeddings = outputs["mean_embeddings"].numpy()
+mean_embeddings = np.array([result.mean_embedding for result in outputs.results])
 labels = np.array(df["cytosolic_label"].tolist())
 
 # Create index splits

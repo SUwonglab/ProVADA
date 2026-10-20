@@ -9,16 +9,16 @@ the search space.
 import os
 import numpy as np
 from pathlib import Path
-from math import floor, ceil
+from math import ceil
 import pandas as pd
 from tqdm import tqdm
 from abc import ABC, abstractmethod
-from omegaconf import OmegaConf
+from contextlib import ExitStack, nullcontext
 
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Literal
 from provada.base_variant import BaseVariant
+from provada.sequences.mask import mask_p
 from provada.utils.log import get_logger
-from provada.utils.env import device_manager
 from provada.utils.setup import seed_everything
 from provada.utils.registry import SAMPLER_REGISTRY
 from provada.utils.cache import shutdown_cache
@@ -27,7 +27,8 @@ from provada.sampler.startup import StartupMixin
 from provada.sampler.reference_ranges import ReferenceRangesMixin
 import wandb
 import time
-import yaml
+
+
 
 
 logger = get_logger(__name__)
@@ -54,17 +55,18 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
         score_weights: Dict[str, float],
         generator_type: str = "random",
         generation_kwargs: Optional[Dict[str, Any]] = None,
-        masking_strategy_type: str = "random",
-        masking_strategy_kwargs: Optional[Dict[str, Any]] = None,
         masking_schedule_config: Optional[Dict[str, Any]] = None,
         temperature_schedule_config: Optional[Dict[str, Any]] = None,
         seed: int = 42,
-        device: Optional[str] = None,
         run_name: Optional[str] = None,
         output_dir: Optional[str] = None,
         reference_distribution_file: Optional[str] = None,
         wandb_run: Optional[wandb.Run] = None,
         config: Optional[Dict[str, Any]] = None,
+        mhc_alleles: Optional[str] = None,
+        greedy: bool = True,
+        normalize: bool = True,
+        resampling_method: Literal["systematic", "multinomial"] = "systematic",
     ):
         """
         Initialize the sampler
@@ -79,18 +81,22 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
                 various weights.
             generator_type: The type of generator to use.
             generation_kwargs: The kwargs to pass to the generation function
-            masking_strategy_type: The type of masking strategy to use.
-            masking_strategy_kwargs: The kwargs to pass to the masking strategy.
             masking_schedule_config: The configuration for the masking schedule.
             temperature_schedule_config: The configuration for the temperature schedule.
             seed: Seed to use for various components of the sampler.
-            device: The device to use for the sampler.
             run_name: The name of the run.
             output_dir: The directory to save the results to. If not provided, defaults to "results".
             reference_distribution_file: The file to load the reference distribution from. If not provided, defaults to None.
             wandb_run: The wandb run to use. If not provided, defaults to None.
             config: Optional config to save to the output directory. NOTE: The
                 config will not be used for anything other than saving to the output directory.
+            mhc_alleles: Comma-separated string of MHC alleles for immunogenicity scoring. If not provided, defaults to None.
+            greedy: For mada, enable top-k selection and weighted population reconstruction (default True).
+            normalize: Scale metrics with fixed bounds and return fitness in [0,1].
+                False combines oriented raw metrics instead. SCORE_delta records
+                improvement relative to the reference in either mode.
+            resampling_method: For non-greedy SMC, use systematic (default) or
+                multinomial resampling of the full weighted population.
 
         """
         # Set input attributes
@@ -99,126 +105,230 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
         self.population_size = population_size
         self.top_k_fraction = top_k_fraction
         self.seed = seed
+        self.greedy = greedy
+        self.normalize = normalize
+        if resampling_method not in ("systematic", "multinomial"):
+            raise ValueError("resampling_method must be 'systematic' or 'multinomial'")
+        self.resampling_method = resampling_method
         self.active_scores_dict = {
             score: {"weight": weight} for score, weight in score_weights.items()
         }
         self.wandb_run = wandb_run
         self.reference_distribution_file = reference_distribution_file
+        self._fitness_weights()
+        self._generator_score_cache = {}
 
-        # Set device manager attributes
-        device_manager.set_device(device)
+        # Keep proto-tools model workers warm for the whole sampler lifetime.
+        # Entered before the first evaluator runs, because initialize_evaluators
+        # scores the base variant and _determine_min_max_ranges can push
+        # thousands of reference variants through the generator before iteration
+        # one. Startup failures and run() both release the owned context.
+        self._compute_stack = ExitStack()
+        self._resources_released = False
+        self._ended = False
+        try:
+            if self.base_variant.num_designable_positions < 1:
+                raise ValueError("Sampling requires at least one designable residue; all residues are fixed")
+            self._compute_stack.enter_context(self._compute_context())
 
-        # Seed everything
-        seed_everything(self.seed)
+            # Seed everything
+            seed_everything(self.seed)
 
-        # Evaluator set up
-        self.evaluators = []
-        self.initialize_evaluators()
+            # Generator set up
+            # initialize generator BEFORE evaluators so that generator-based scores can be computed
+            self.generation_kwargs = generation_kwargs
+            self.generator = None
+            self.initialize_generator(generator_type, generation_kwargs)
 
-        # Generator set up
-        self.generation_kwargs = generation_kwargs
-        self.generator = None
-        self.initialize_generator(generator_type, generation_kwargs)
+            # Evaluator set up
+            self.evaluators = []
+            self.initialize_evaluators()
 
-        # Masking strategy set up
-        self.masking_strategy = None
-        self.initialize_masking_strategy(masking_strategy_type, masking_strategy_kwargs)
+            # Masking schedule set up
+            self.masking_schedule = None
+            self.initialize_masking_schedule(masking_schedule_config)
 
-        # Masking schedule set up
-        self.masking_schedule = None
-        self.initialize_masking_schedule(masking_schedule_config)
+            # Temperature schedule set up
+            self.temperature_schedule = None
+            self.initialize_temperature_schedule(temperature_schedule_config)
 
-        # Temperature schedule set up
-        self.temperature_schedule = None
-        self.initialize_temperature_schedule(temperature_schedule_config)
+            # Set up run name if not provided
+            if run_name is None:
+                run_name = f"sampler_run_{time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())}"
 
-        # Set up run name if not provided
-        if run_name is None:
-            run_name = f"sampler_run_{time.strftime('%Y-%m-%d_%H-%M-%S', time.localtime())}"
+            self.run_name = run_name
 
-        self.run_name = run_name
+            # Set up output directory
+            if output_dir is None:
+                output_dir = Path("results")
 
-        # Set up output directory
-        if output_dir is None:
-            output_dir = Path("results")
+            self.output_dir = Path(output_dir) / run_name
 
-        self.output_dir = Path(output_dir) / run_name
+            os.makedirs(self.output_dir, exist_ok=True)
 
-        os.makedirs(self.output_dir, exist_ok=True)
+            # If config is provided, save it to the output directory
+            if config is not None:
+                config.save_yaml(self.output_dir / f"{run_name}_config.yaml")
 
-        # If config is provided, save it to the output directory
-        if config is not None:
-            with open(
-                self.output_dir / f"{run_name}_config.yaml",
-                "w",
-            ) as f:
-                yaml.dump(OmegaConf.to_container(config, resolve=True), f)
+            self.iteration = 0
 
-        self.iteration = 0
+            # Tracking
+            self.observed_value_stats = {
+                score_name: {"min": np.inf, "max": -np.inf}
+                for score_name in self.active_scores_dict.keys()
+            }
+            self.observed_value_stats["SCORE"] = {"min": np.inf, "max": -np.inf}
 
-        # Tracking
-        self.observed_value_stats = {
-            score_name: {"min": np.inf, "max": -np.inf}
-            for score_name in self.active_scores_dict.keys()
-        }
-        self.observed_value_stats["SCORE"] = {"min": np.inf, "max": -np.inf}
+            self.run_stats = {
+                "num_unique_sequences": 0,
+                "total_sequences_evaluated": 0,
+            }
 
-        self.run_stats = {
-            "num_unique_sequences": 0,
-            "total_sequences_evaluated": 0,
-        }
+            # Collection of sequence hashes of sequences we have seen
+            self.sequence_hashes = set()
 
-        # Collection of sequence hashes of sequences we have seen
-        self.sequence_hashes = set()
+            if self.wandb_run is not None:
+                # Log the base variant scores
+                self.wandb_run.summary.update(
+                    {"base_variant_scores": self.base_variant.score_dict}
+                )
 
-        if self.wandb_run is not None:
-            # Log the base variant scores
-            self.wandb_run.summary.update(
-                {"base_variant_scores": self.base_variant.score_dict}
+            logger.info(
+                f"Sampler {self.__class__.__name__} run ({self.run_name}) initialized. Results will be cached to {self.output_dir}"
             )
-
-        logger.info(
-            f"Sampler {self.__class__.__name__} run ({self.run_name}) initialized. Results will be cached to {self.output_dir}"
-        )
+        except BaseException as error:
+            # Construction has not started CSV writers or produced complete
+            # outputs. Release only the resources acquired during startup.
+            cleanup_errors = self._release_resources(flush_cache=False)
+            self._finish_tracking(status="error", errors=cleanup_errors)
+            self._ended = True
+            for label, cleanup_error in cleanup_errors:
+                error.add_note(f"Cleanup failed during {label}: {cleanup_error}")
+            raise
 
     # ===== Helper Functions =====
     def mask_sequences(self, iteration_df: pd.DataFrame):
         """
-        Masks the sequences using the masking strategy.
-        """
-        return self.masking_strategy.create_masked_sequences(
-            sequences=iteration_df,
-            num_masked_sites=max(
-                floor(
-                    self.masking_schedule(iteration=self.iteration)
-                    * self.base_variant.num_designable_positions
-                ),
-                1,  # Always make sure there is at least one masked site
-            ),
-        )
+        Masks a random fraction of each sequence's designable positions.
 
-    def generate_variants(self, iteration_df: pd.DataFrame):
+        The fraction comes from the masking schedule. ProteinMPNN shares one
+        mask across repeated copies of an ancestor within this iteration, so
+        all their completions can be batched. Other generators mask each row
+        independently. Every particle retains its own parent metadata.
+        """
+        fraction = self.masking_schedule(iteration=self.iteration)
+        fixed = self.base_variant.fixed_position_indices
+        if getattr(self.generator, "batch_shared_prompts", False):
+            masked_by_ancestor = {}
+            for sequence in iteration_df["sequence"]:
+                if sequence not in masked_by_ancestor:
+                    masked_by_ancestor[sequence] = mask_p(sequence, p=fraction, fixed_indices=fixed)
+            iteration_df["prompt"] = iteration_df["sequence"].map(masked_by_ancestor)
+            return iteration_df
+
+        iteration_df["prompt"] = [
+            mask_p(
+                sequence,
+                p=fraction,
+                fixed_indices=fixed,
+            )
+            for sequence in iteration_df["sequence"]
+        ]
+        return iteration_df
+
+    def generate_variants(self, iteration_df: pd.DataFrame, **generation_overrides):
         """
         Generates a series of sequences using the generator.
         """
-        if isinstance(self.generation_kwargs, dict):
-            generate_kwargs = self.generation_kwargs
-        else:
-            generate_kwargs = OmegaConf.to_container(self.generation_kwargs, resolve=True)
+        # Copy so the per-generator extras below don't accumulate across iterations.
+        generate_kwargs = dict(self.generation_kwargs)
 
         # Get any extra kwargs needed by this generator
         extra_kwargs = self.generator.get_extra_kwargs(self.base_variant)
         generate_kwargs.update(extra_kwargs)
+        generate_kwargs.update(generation_overrides)
 
         return self.generator.generate(
             iteration_df,
             **generate_kwargs,
         )
 
+    @staticmethod
+    def _finite_scores(values, name):
+        """Reject missing, nonnumeric, or nonfinite required metric values."""
+        try:
+            array = np.asarray(values, dtype=float)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Active score '{name}' must be numeric and finite") from error
+        if not np.isfinite(array).all():
+            raise ValueError(f"Active score '{name}' contains missing or nonfinite values")
+        return array
+
+    def _fitness_weights(self):
+        weights = np.asarray([info["weight"] for info in self.active_scores_dict.values()], dtype=float)
+        if len(weights) == 0 or not np.isfinite(weights).all() or (weights < 0).any() or not (weights > 0).any():
+            raise ValueError("Score weights must be finite, nonnegative, and have a positive total")
+        weights = weights / weights.max()
+        return weights / weights.sum()
+
+    def _fitness_component(self, values, name, info):
+        values = self._finite_scores(values, name)
+        if not getattr(self, "normalize", True):
+            return values if info["larger_is_better"] else -values
+        lower, upper = info["min_value"], info["max_value"]
+        try:
+            valid = np.isfinite([lower, upper]).all() and upper > lower
+        except TypeError:
+            valid = False
+        if not valid:
+            raise ValueError(f"Active score '{name}' requires finite bounds with max_value > min_value")
+        values = np.clip((values - lower) / (upper - lower), 0.0, 1.0)
+        return values if info["larger_is_better"] else 1.0 - values
+
+    def _canonical_generator_scores(self, iteration_df, score_subset=None):
+        """Use fixed-seed sequence scores, never proposal-time MPNN scores.
+
+        The cache is specific to the generator, backbone, chain order, checkpoint
+        and scoring seed. Each unseen unique sequence is scored once in a batch.
+        """
+        needed = set(self.active_scores_dict if score_subset is None else score_subset)
+        if "mpnn_score" not in needed:
+            return iteration_df
+        frame = iteration_df.copy()
+        if "sequence" not in frame or not frame["sequence"].map(lambda value: isinstance(value, str)).all():
+            raise ValueError("Canonical MPNN scoring requires a sequence string for every row")
+        structure = self.base_variant.structure
+        if structure is None:
+            raise ValueError("Canonical MPNN scoring requires a backbone structure")
+        generator = self.generator
+        backbone = getattr(structure, "structure_pdb", str(structure))
+        chains = tuple(structure.get_chain_ids()) if hasattr(structure, "get_chain_ids") else ()
+        context = (id(generator), getattr(generator, "seed", None),
+                   getattr(generator, "_TOOLKIT", None), getattr(generator, "_WEIGHTS", None),
+                   getattr(generator, "device", None), backbone, chains)
+        cache = getattr(self, "_generator_score_cache", None)
+        if cache is None:
+            cache = self._generator_score_cache = {}
+        unique = frame["sequence"].drop_duplicates().tolist()
+        unseen = [sequence for sequence in unique if (context, sequence) not in cache]
+        if unseen:
+            scored = generator.score(
+                sequences=unseen, **generator.get_extra_kwargs(self.base_variant)
+            )
+            if len(scored) != len(unseen) or "mpnn_score" not in scored:
+                raise ValueError("Canonical MPNN scorer must return one mpnn_score per sequence")
+            values = self._finite_scores(scored["mpnn_score"], "mpnn_score")
+            cache.update({(context, sequence): float(value) for sequence, value in zip(unseen, values)})
+        if "mpnn_score" in frame:
+            frame["generation_mpnn_score"] = frame["mpnn_score"]
+        frame["mpnn_score"] = [cache[(context, sequence)] for sequence in frame["sequence"]]
+        return frame
+
     def evaluate_variants(self, iteration_df: pd.DataFrame) -> pd.DataFrame:
         """
         Evaluates a series of sequences and returns a dataframe of the scores.
         """
+        iteration_df = self._canonical_generator_scores(iteration_df)
         score_dfs = []
         for evaluator in self.evaluators:
             extra_kwargs = evaluator.get_extra_kwargs(self.base_variant)
@@ -232,7 +342,7 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
             )
 
         # Concatenate the score dfs (all sequences are in the same order)
-        full_df = pd.concat(score_dfs, axis=1)
+        full_df = pd.concat(score_dfs, axis=1) if score_dfs else pd.DataFrame(index=iteration_df.index)
 
         # Concatenate the generated population df to the score dfs
         full_df = pd.concat([iteration_df, full_df], axis=1)
@@ -245,46 +355,39 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
 
     def calculate_scores(self, iteration_df: pd.DataFrame) -> pd.DataFrame:
         """
-        Calculates the scores relative to the base variant. If the score is lower
-        than the base variant, it is set to 0.
+        Combine finite oriented metrics. Bounds stay fixed for the entire run.
+
+        With normalize=True, SCORE is a weighted mean in [0,1]. Without it,
+        SCORE is a weighted mean of oriented raw metrics. SCORE_delta always
+        records the signed improvement over the reference under that objective.
         """
+        weights = self._fitness_weights()
+        components, deltas = [], []
         for score_name, score_info in self.active_scores_dict.items():
-
-            # Get the base variant normalized score
-            base_variant_normalized_score = self.base_variant.normalized_score_dict[score_name]
-
-            # Scale the score. Clip to be between 0 and 1.
-            iteration_df[score_name + "_normalized"] = (
-                iteration_df[score_name]
-                .sub(score_info["min_value"])
-                .div(score_info["max_value"] - score_info["min_value"])
-            ).clip(lower=0, upper=1)
-
-            # Flip score if larger is not better
-            if not score_info["larger_is_better"]:
-                iteration_df[score_name + "_normalized"] = (
-                    1 - iteration_df[score_name + "_normalized"]
-                )
-
-            # Calculate the delta of the scores by subtracting the base variant normalized score
-            iteration_df[score_name + "_delta"] = iteration_df[score_name + "_normalized"].sub(
-                base_variant_normalized_score
-            )
-
-        # Calculate the total score as a weighted sum of the deltas
-        delta_cols = [score_name + "_delta" for score_name in self.active_scores_dict.keys()]
-        weights_dict = {
-            score_delta: self.active_scores_dict[score_delta.replace("_delta", "")]["weight"]
-            for score_delta in delta_cols
-        }
-        # Calculate sum of weights
-        sum_of_weights = sum(weights_dict.values())
-
-        iteration_df["SCORE"] = (
-            iteration_df.loc[:, delta_cols].mul(weights_dict, axis=1).sum(axis=1)
-        ).div(sum_of_weights)
-
+            if score_name not in iteration_df:
+                raise ValueError(f"Missing active score '{score_name}'")
+            component = self._fitness_component(iteration_df[score_name], score_name, score_info)
+            if getattr(self, "normalize", True):
+                reference = self.base_variant.normalized_score_dict[score_name]
+                iteration_df[score_name + "_normalized"] = component
+            else:
+                reference = self._fitness_component(
+                    [self.base_variant.score_dict[score_name]], score_name, score_info
+                )[0]
+            self._finite_scores([reference], f"{score_name} reference")
+            delta = component - reference
+            iteration_df[score_name + "_delta"] = delta
+            components.append(component)
+            deltas.append(delta)
+        iteration_df["SCORE"] = np.column_stack(components) @ weights
+        iteration_df["SCORE_delta"] = np.column_stack(deltas) @ weights
+        self._finite_scores(iteration_df["SCORE"], "SCORE")
+        self._finite_scores(iteration_df["SCORE_delta"], "SCORE_delta")
         return iteration_df
+
+    def _get_top_k(self, num_candidates: int) -> int:
+        """Return the number of candidate rows retained before reconstruction."""
+        return ceil(self.top_k_fraction * num_candidates)
 
     @abstractmethod
     def select_variants(
@@ -334,11 +437,16 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
         # Calculate acceptance probabilities for selected variants
         scores = iteration_df["SCORE"]
         starting_scores = iteration_df["starting_SCORE"]
-        acceptance_probabilities = np.exp((scores - starting_scores) / T)
+        if not np.isfinite(T) or T <= 0:
+            raise ValueError("MH temperature must be finite and positive")
+        if not np.isfinite(scores).all() or not np.isfinite(starting_scores).all():
+            raise ValueError("MH scores must be finite")
+        log_acceptance = np.minimum((scores - starting_scores) / T, 0.0)
 
         # Vectorized operation to determine acceptance
         random_values = np.random.rand(len(iteration_df))
-        iteration_df["accepted"] = random_values < acceptance_probabilities.values
+        with np.errstate(divide="ignore"):
+            iteration_df["accepted"] = np.log(random_values) < log_acceptance.values
 
         # Finally, add the proposal sequence and proposal score columns for selection
         iteration_df["proposal_sequence"] = np.where(
@@ -375,50 +483,123 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
             population_scores,
         )
 
+    def _compute_context(self):
+        """Return the compute context for this sampler's model calls.
+
+        A ``ToolPool`` enters proto-tools' persistence context itself, so one
+        block gives both warm workers and multi-GPU fan-out. Entering is a no-op
+        when a pool is already active, which lets a caller own the pool and
+        share it across several samplers — and is required, since proto-tools
+        refuses nested pools.
+
+        The pool takes every GPU it can see, so ``CUDA_VISIBLE_DEVICES``
+        chooses where a run lands — including the empty string for a CPU run,
+        which leaves the pool with no devices to reserve.
+
+        Returns:
+            A context manager: a new ``ToolPool`` or ``nullcontext``.
+        """
+        from proto_tools.utils import ToolPool
+        from proto_tools.utils.tool_pool import _active_pool
+
+        if _active_pool.get() is not None:
+            return nullcontext()
+
+        return ToolPool()
+
+    def _release_resources(self, flush_cache=True):
+        """Release writers and compute once, independently of export failures."""
+        if getattr(self, "_resources_released", False):
+            return []
+        self._resources_released = True
+        errors = []
+        actions = []
+        if flush_cache:
+            actions.append(("CSV cache shutdown", shutdown_cache))
+        stack = getattr(self, "_compute_stack", None)
+        if stack is not None:
+            actions.append(("compute context shutdown", stack.close))
+        for label, action in actions:
+            try:
+                action()
+            except BaseException as error:
+                errors.append((label, error))
+        return errors
+
+    def _finish_tracking(self, status, errors):
+        """Finish tracking after the caller has collected all other errors."""
+        run = getattr(self, "wandb_run", None)
+        if run is not None:
+            try:
+                run.finish(exit_code=0 if status == "success" and not errors else 1)
+            except BaseException as error:
+                errors.append(("W&B shutdown", error))
+
     def end_run(self, status: str = "success"):
-        """
-        Executes at the end of a run of the sampler
-        """
-
-        # Shutdown the cache
-        shutdown_cache()
-
-        # End the wandb run
-        if self.wandb_run is not None:
-            if status == "success":
-                self.wandb_run.finish(exit_code=0)
-            elif status == "killed":
-                pass  # We don't need to do anything here, wandb automatically detects for killed runs
-            elif status == "error":
-                self.wandb_run.finish(exit_code=1)
-
-        # Copy the log file to the output directory
-        logger.copy_log_file(dst_dir=self.output_dir)
-
-        # Save the base variant scores to the output directory
-        self.base_variant.save_yaml(self.output_dir / "base_variant_scores.yaml")
+        """Release workers and writers before independently saving diagnostics."""
+        if getattr(self, "_ended", False):
+            return
+        self._ended = True
+        errors = self._release_resources()
+        output_dir = getattr(self, "output_dir", None)
+        if output_dir is not None:
+            actions = [
+                ("log copy", lambda: logger.copy_log_file(dst_dir=output_dir)),
+                ("reference score export", lambda: self.base_variant.save_yaml(output_dir / "base_variant_scores.yaml")),
+            ]
+            for label, action in actions:
+                try:
+                    action()
+                except BaseException as error:
+                    errors.append((label, error))
+        self._finish_tracking(status=status, errors=errors)
+        if errors:
+            first_label, first_error = errors[0]
+            first_error.add_note(f"Cleanup failed during {first_label}")
+            for label, error in errors[1:]:
+                first_error.add_note(f"Additional cleanup failure during {label}: {error}")
+            raise first_error
 
     # ===== Main Loop =====
+    def initialize_population(self):
+        """Legacy optimization samplers start from copies of the reference."""
+        reference = self.calculate_scores(pd.DataFrame([self.base_variant.score_dict]))
+        initial = pd.concat([reference] * self.population_size, ignore_index=True)
+        initial["sequence"] = self.base_variant.sequence
+        initial["proposal_sequence"] = self.base_variant.sequence
+        initial["proposal_SCORE"] = initial["SCORE"]
+        initial["selected_count"] = 1
+        initial["accepted"] = True
+        self.iteration = -1
+        try:
+            self._cache_generations(initial, record_generated=False)
+        finally:
+            self.iteration = 0
+        return (
+            [self.base_variant.sequence] * self.population_size,
+            [float(reference["SCORE"].iloc[0])] * self.population_size,
+        )
+
     def run(self):
-        """
-        Runs the sampler
-        """
-        status = "success"
+        """Run sampling and release resources without masking its original error."""
+        if getattr(self, "_ended", False) or getattr(self, "_resources_released", False):
+            raise RuntimeError("Sampler has already been closed")
+        status, original_error = "success", None
         try:
             self._run()
-        except KeyboardInterrupt as e:
-            logger.info(f"Sampler interrupted by user during iteration {self.iteration}")
-            status = "killed"
-            raise e
-        except Exception as e:
-            logger.error(f"Error running sampler during iteration {self.iteration}: {e}")
-            status = "error"
-            raise e
+        except BaseException as error:
+            original_error = error
+            status = "killed" if isinstance(error, KeyboardInterrupt) else "error"
+            raise
         finally:
             try:
                 self.end_run(status=status)
-            except Exception as cleanup_error:
-                logger.error(f"Error during cleanup: {cleanup_error}")
+            except BaseException as cleanup_error:
+                if original_error is None:
+                    raise
+                original_error.add_note(f"Cleanup also failed: {cleanup_error}")
+                for note in getattr(cleanup_error, "__notes__", []):
+                    original_error.add_note(note)
 
     def _run(self):
         """
@@ -433,8 +614,7 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
         self._determine_min_max_ranges()
 
         # Initialize population dataframe
-        population = [self.base_variant.sequence] * self.population_size
-        population_scores = [0] * self.population_size
+        population, population_scores = self.initialize_population()
 
         # Iterate
         for iteration_num in tqdm(
@@ -448,8 +628,9 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
             # Explode the population by the number of variants per sequence
             iteration_df = pd.DataFrame(
                 [
-                    {"sequence": sequence, "starting_SCORE": score}
-                    for sequence, score in zip(population, population_scores)
+                    {"sequence": sequence, "starting_SCORE": score,
+                     "parent_particle_id": parent_id}
+                    for parent_id, (sequence, score) in enumerate(zip(population, population_scores))
                 ]
             )
 
@@ -472,12 +653,6 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
             logger.info(f"Calculating scores for iteration {iteration_num}")
             iteration_df = self.calculate_scores(iteration_df=iteration_df)
 
-            # Update masking strategy
-            self.masking_strategy.update(
-                masked_strings=iteration_df["prompt"].tolist(),
-                rewards=iteration_df["SCORE"].tolist(),
-            )
-
             # Initialize the selected count to 0
             iteration_df["selected_count"] = 0
 
@@ -485,7 +660,7 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
             logger.info(f"Selecting variants for iteration {iteration_num}")
             iteration_df = self.select_variants(
                 iteration_df=iteration_df,
-                top_k=ceil(self.top_k_fraction * len(iteration_df)),
+                top_k=self._get_top_k(len(iteration_df)),
                 num_to_select=self.population_size,
             )
 
@@ -503,6 +678,8 @@ class Sampler(ABC, TrackingMixin, StartupMixin, ReferenceRangesMixin):
             # Update starting point with selected variants
             logger.info(f"Updating population for iteration {iteration_num}")
             population, population_scores = self.update_population(iteration_df=iteration_df)
+
+        self._save_final_population(population, population_scores)
 
 
 @SAMPLER_REGISTRY.register("rejection")
@@ -536,47 +713,105 @@ class Rejection(Sampler):
         return iteration_df
 
 
-@SAMPLER_REGISTRY.register("mada_greedy")
-class MADAGreedy(Sampler):
+def resample_systematic(idx, weights, K, rng):
+    """Draw K indices directly from all non-negative particle weights."""
+    idx = np.asarray(idx)
+    w = np.asarray(weights, dtype=float)
+    if K < 0 or int(K) != K:
+        raise ValueError("Resample size must be a non-negative integer")
+    K = int(K)
+    if K == 0:
+        return idx[:0]
+    if w.ndim != 1 or len(w) != len(idx) or len(w) == 0:
+        raise ValueError("Weights and indices must be nonempty and have equal length")
+    if not np.isfinite(w).all() or (w < 0).any():
+        raise ValueError("Resampling weights must be finite and non-negative")
+    w_sum = w.sum()
+    if not np.isfinite(w_sum) or w_sum <= 0:
+        raise ValueError("Resampling weights must have positive finite total mass")
+    cdf = np.cumsum(w / w_sum)
+    cdf[-1] = 1.0
+    u0 = rng.random() / K
+    u = u0 + (np.arange(K, dtype=float) / K)
+    return idx[np.searchsorted(cdf, np.minimum(u, np.nextafter(1.0, 0.0)), side="right")]
 
-    def select_variants(
+
+@SAMPLER_REGISTRY.register("mada")
+class MADA(Sampler):
+    """
+    MADA with stochastic and greedy top-K sampling policies.
+
+    For a current-target invariant MH move, the reversed-kernel SMC weight is
+    exp((beta_t - beta_{t-1}) * f(parent)), not f(the moved state).
+
+    The first population is drawn from the generator with all designable sites
+    masked (beta=0). Target-law validity assumes that partial-refill proposals
+    are reversible with respect to that same generator prior; the SMC mechanics
+    do not establish this property for a learned generator.
+
+    greedy=True (the default) enables top-k selection and weighted population reconstruction.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Initialize RNG for reproducible resampling
+        self.rng = np.random.default_rng(self.seed)
+
+    def initialize_population(self):
+        if self.greedy:
+            return super().initialize_population()
+
+        # A point mass of identical WT copies is not a sample from the prior.
+        # Draw one independent completion per particle before annealing starts.
+        fixed = set(self.base_variant.fixed_position_indices)
+        prompt = "".join(
+            residue if position in fixed else "_"
+            for position, residue in enumerate(self.base_variant.sequence)
+        )
+        initial_df = pd.DataFrame({
+            "prompt": [prompt] * self.population_size,
+            "starting_sequence": [self.base_variant.sequence] * self.population_size,
+            "starting_SCORE": [0.0] * self.population_size,
+            "parent_particle_id": np.arange(self.population_size),
+        })
+        initial_df = self.generate_variants(initial_df, generations_per_sequence=1)
+        if len(initial_df) != self.population_size:
+            raise ValueError("SMC initialization requires one prior draw per particle")
+        self.run_stats["total_sequences_evaluated"] += len(initial_df)
+        initial_df = self.calculate_scores(self.evaluate_variants(initial_df))
+        if not np.isfinite(initial_df["SCORE"]).all():
+            raise ValueError("SMC initial scores must be finite")
+
+        # Include prior draws in the lookup table and mark their trajectory as
+        # initialization, before temperature step zero.
+        initial_df["accepted"] = True
+        initial_df["selected_count"] = 1
+        initial_df["proposal_sequence"] = initial_df["sequence"]
+        initial_df["proposal_SCORE"] = initial_df["SCORE"]
+        self.iteration = -1
+        try:
+            self._cache_generations(initial_df)
+        finally:
+            self.iteration = 0
+        return initial_df["sequence"].tolist(), initial_df["SCORE"].tolist()
+
+    def _get_top_k(self, num_candidates: int) -> int:
+        if self.greedy:
+            return super()._get_top_k(num_candidates)
+
+        requested_k = super()._get_top_k(num_candidates)
+        if requested_k != self.population_size and not getattr(self, "_top_k_message_logged", False):
+            logger.info(
+                "top_k_fraction is ignored for stochastic sampling; "
+                f"using K=N={self.population_size}."
+            )
+            self._top_k_message_logged = True
+        return self.population_size
+
+    def _select_greedy_variants(
         self, iteration_df: pd.DataFrame, top_k: int, num_to_select: int
     ) -> pd.DataFrame:
-        """
-        Selects the top_k variants with the highest scores. If top_k is less than
-        num_to_select, the remaining variants are selected in ranked order.
-        """
-        # Metropolis-Hastings
-        iteration_df = self.metropolis_hastings_filter(iteration_df=iteration_df)
-
-        # Sort the variants by score
-        iteration_df = iteration_df.sort_values(
-            by="proposal_SCORE", ascending=False
-        ).reset_index(drop=True)
-
-        # Distribute num_to_select across top_k variants
-        base_count = num_to_select // top_k
-        extra_count = num_to_select % top_k
-
-        iteration_df.loc[: top_k - 1, "selected_count"] = base_count
-        iteration_df.loc[: extra_count - 1, "selected_count"] += 1
-
-        return iteration_df
-
-
-@SAMPLER_REGISTRY.register("mada_topk_is")
-class MADATopKIS(Sampler):
-
-    def select_variants(
-        self, iteration_df: pd.DataFrame, top_k: int, num_to_select: int
-    ) -> pd.DataFrame:
-        """
-        Greedy selection: deterministically selects top_k variants by score,
-        then uses temperature-weighted resampling among those elites to reach num_to_select.
-
-        This is a hybrid approach that combines deterministic elite selection
-        with probabilistic resampling based on annealed weights.
-        """
+        """Select top-K retained states and reconstruct with annealed weights."""
         # Metropolis-Hastings
         iteration_df = self.metropolis_hastings_filter(iteration_df=iteration_df)
 
@@ -609,62 +844,55 @@ class MADATopKIS(Sampler):
 
         return iteration_df
 
-
-def resample_systematic(idx, weights, K, rng):
-    w = np.asarray(weights, dtype=float)
-    w_sum = w.sum()
-    if not np.isfinite(w_sum) or w_sum <= 0:
-        w = np.ones_like(w) / w.size
-    else:
-        w = w / w_sum
-    cdf = np.cumsum(w)
-    u0 = rng.random() / K
-    u = u0 + (np.arange(K, dtype=float) / K)
-    return idx[np.searchsorted(cdf, u, side="left")]
-
-
-@SAMPLER_REGISTRY.register("mada_stochastic")
-class MADAStochastic(Sampler):
-    """
-    Two stage resampling scheme for MADA with systematic resampling for the first stage.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Initialize RNG for reproducible resampling
-        self.rng = np.random.default_rng(self.seed)
-
     def select_variants(
         self, iteration_df: pd.DataFrame, top_k: int, num_to_select: int
     ) -> pd.DataFrame:
-        iteration_df = self.metropolis_hastings_filter(iteration_df=iteration_df)
+        if self.greedy:
+            return self._select_greedy_variants(iteration_df, top_k, num_to_select)
+
+        iteration_df = iteration_df.reset_index(drop=True).copy()
 
         if len(iteration_df) == 0:
             iteration_df["selected_count"] = 0
             return iteration_df
 
-        top_k = max(1, min(int(top_k), len(iteration_df)))
-        num_to_select = max(1, int(num_to_select))
+        if num_to_select < 1 or int(num_to_select) != num_to_select:
+            raise ValueError("SMC population size must be a positive integer")
         curr_T = self.temperature_schedule(iteration=self.iteration)
         prev_T = (
             self.temperature_schedule(iteration=self.iteration - 1)
             if self.iteration > 0
             else np.inf
         )
-        temp_factor = (1.0 / curr_T) if prev_T == np.inf else (1.0 / curr_T - 1.0 / prev_T)
+        if not np.isfinite(curr_T) or curr_T <= 0 or prev_T <= 0 or np.isnan(prev_T):
+            raise ValueError("SMC temperatures must be positive, with finite current temperature")
+        temp_factor = 1.0 / curr_T - 1.0 / prev_T
 
-        s = iteration_df["proposal_SCORE"].to_numpy()
-        logw = s * temp_factor
-        logw = np.where(np.isfinite(logw), logw, -np.inf)
-        w = np.exp(logw - np.nanmax(logw))
+        parent_scores = iteration_df["starting_SCORE"].to_numpy(dtype=float)
+        if not np.isfinite(parent_scores).all():
+            raise ValueError("SMC parent scores must be finite")
+        logw = parent_scores * temp_factor
+        if "parent_particle_id" in iteration_df:
+            parents = iteration_df.groupby("parent_particle_id", sort=False)
+            if (parents["starting_SCORE"].nunique() != 1).any():
+                raise ValueError("All descendants of a particle must share its parent score")
+            # Each ancestor's mass is shared by its descendants, so an ancestor
+            # returning more designs does not acquire more importance weight.
+            logw -= np.log(parents["starting_SCORE"].transform("size").to_numpy())
+        weights = np.exp(logw - logw.max())
 
-        if not np.isfinite(w).any() or w.sum() == 0:
-            w = np.ones_like(w)
-        w = w / w.sum()
-
-        idx = iteration_df.index.to_numpy()
-        elite_indices = resample_systematic(idx, w, top_k, self.rng)
-        final_indices = self.rng.choice(elite_indices, size=num_to_select, replace=True)
+        # Batched moves are drawn before selection, but their outcomes must not
+        # enter the reversed-kernel incremental weights.
+        iteration_df = self.metropolis_hastings_filter(iteration_df=iteration_df)
+        indices = iteration_df.index.to_numpy()
+        if self.resampling_method == "multinomial":
+            final_indices = self.rng.choice(
+                indices, size=int(num_to_select), replace=True, p=weights / weights.sum()
+            )
+        else:
+            final_indices = resample_systematic(
+                indices, weights, int(num_to_select), self.rng
+            )
         iteration_df["selected_count"] = 0
         counts = pd.Series(final_indices).value_counts()
         iteration_df.loc[counts.index, "selected_count"] = counts.to_numpy()

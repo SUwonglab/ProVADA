@@ -24,7 +24,7 @@ except FileNotFoundError:
 setuptools.setup(
     # --- Project Metadata ---
     name="provada",
-    version="2.0.0",
+    version="1.1.0",
     author="Sophia Lu, Ben Viggiano, Xiaowei Zhang",
     author_email="sophialu@stanford.edu, viggiano@stanford.edu, zhangxw@stanford.edu",
     description="Official implementation of the ProVADA package for conditional protein variant design.",
@@ -36,12 +36,13 @@ setuptools.setup(
     project_urls={
         "Homepage": "https://github.com/SUwonglab/provada",
         "Bug Tracker": "https://github.com/SUwonglab/provada/issues",
-        "Publication": "https://www.biorxiv.org/content/10.1101/2025.07.11.664238v1",
     },
     # --- Build Configuration ---
-    packages=["provada"],
+    packages=setuptools.find_namespace_packages(include=["provada", "provada.*"]),
+    package_data={"": ["*.sh", "*.txt", "*.md"]},
+    include_package_data=True,
     # --- Dependencies ---
-    python_requires=">=3.11",
+    python_requires=">=3.12",
     install_requires=requirements,  # Read from requirements.txt
     # --- Classifiers for PyPI ---
     classifiers=[

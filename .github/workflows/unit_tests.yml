@@ -1,5 +1,5 @@
-# .github/workflows/unit_tests.yml
-name: CPU Unit Tests
+# .github/workflows/test_install.yml
+name: Run Unit Tests
 
 on:
   pull_request:
@@ -39,6 +39,6 @@ jobs:
         run: |
           python -c "import provada"
 
-      - name: Run CPU unit tests
+      - name: Run unit tests
         run: |
           pytest --no-wandb --skip-gpu

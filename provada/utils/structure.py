@@ -53,6 +53,8 @@ AA1_TO_3 = {
     "V": "VAL",
 }
 
+AA3_TO_1 = {v: k for k, v in AA1_TO_3.items()}
+
 
 class ProteinStructure:
     """Base class for representing protein structures
@@ -231,6 +233,22 @@ class ProteinStructure:
             return convert_cif_str_to_pdb_str(self.structure)
         else:
             return self.structure
+
+    @property
+    def resolved_structure_pdb(self) -> str:
+        """PDB string holding only the residues that have an alpha carbon.
+
+        A residue modelled without its alpha carbon - an N-terminus with only N
+        and C, say - is one a structure-conditioned model cannot place, and such
+        a model typically drops it rather than failing. Removing those residues
+        up front keeps the structure and the model's output the same length, so
+        the output still maps onto the input's numbering.
+
+        The original text is returned unchanged when every residue has an alpha
+        carbon, which keeps records a rewrite would drop, ``REMARK 465`` among
+        them.
+        """
+        return structure_pdb_without_ca_less_residues(self)
 
     @property
     def structure_cif(self) -> str:
@@ -422,6 +440,34 @@ def make_minimal_backbone_structure(
     return new_struct
 
 
+def structure_pdb_without_ca_less_residues(structure: "ProteinStructure") -> str:
+    """
+    Return the structure as PDB text, without residues that have no alpha carbon.
+
+    Args:
+        structure: The structure to filter.
+
+    Returns:
+        PDB text of the remaining residues, or the structure's own PDB text when
+        there was nothing to remove.
+    """
+    filtered = structure.gemmi_struct.clone()
+
+    removed = 0
+    for model in filtered:
+        for chain in model:
+            # Iterate backwards over indices so deletion cannot shift them.
+            for i in range(len(chain) - 1, -1, -1):
+                if chain[i].get_ca() is None:
+                    del chain[i]
+                    removed += 1
+
+    if not removed:
+        return structure.structure_pdb
+
+    return filtered.make_pdb_string()
+
+
 # ===============================
 # Sequence override
 # ===============================
@@ -543,7 +589,13 @@ def extract_missing_residues_from_pdb_text(
         if chain is not None and ch != chain:
             continue
 
-        key = (resseq, icode, resname) if return_triplets else resseq
+        if return_triplets:
+            # Convert 3-letter to 1-letter code if possible, else keep original
+            resname_1 = AA3_TO_1.get(resname, "X")
+            key = (resseq, icode, resname_1)
+        else:
+            key = resseq
+            
         missing.setdefault(ch, set()).add(key)
 
     if return_triplets:

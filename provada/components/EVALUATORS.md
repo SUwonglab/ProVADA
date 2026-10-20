@@ -2,6 +2,21 @@
 
 Evaluators are the scoring functions that assess the quality of generated protein sequences. ProVADA comes with several built-in evaluators for localization prediction, structure quality, sequence similarity, and more, but you can easily create your own custom evaluators to score sequences according to your specific objectives.
 
+## Built-in Evaluators
+
+ProVADA includes several evaluators you can use as references or extend:
+
+- **`Dummy`** (`dummy`) - Simple example that counts methionines; great starting point
+- **`SequenceSimilarity`** (`sequence_similarity`) - Computes metrics like hamming distance, identity, etc.
+- **`LocalizationPredictor`** (`localization_predictor`) - Predicts protein localization using ESM2 embeddings
+- **`DiscountedHammingDistance`** (`discounted_hamming_distance`) - Distance to the reference discounted by localization probability; the worked example of folding several scores into one evaluator
+- **`StructureMetrics`** (`structure`) - Predicts structures with ESMFold2 and scores them with SAP and Rosetta energy
+- **`ImmunogenicityMetrics`** (`Immunogenicity`) - Predicted MHC class I presentation from netMHCpan, excluding self peptides
+- **`MPNNGeneratorEvaluator`** (`mpnn_score`) - Reads the ProteinMPNN score the generator already produced
+- **`CalibyGeneratorEvaluator`** (`caliby_energy_score`) - Reads the Caliby Potts energy the generator already produced
+
+Browse `provada/components/evaluator.py` to see these implementations.
+
 ## Understanding Evaluators
 
 An evaluator takes a list of protein sequences and returns numerical scores that quantify some property of interest. These scores are then used by the sampler to guide the directed evolution process toward sequences with desired characteristics. Evaluators automatically handle caching, parallel processing, and integration with the sampling loop—you just need to define how to score sequences.
@@ -114,90 +129,9 @@ These extra kwargs will be automatically passed to your `evaluate_sequences()` m
         ...
 ```
 
-## Optional: Worker Process Initialization
-
-If your evaluator needs to load heavy resources (models, libraries) that should be initialized once per worker process rather than in the main process, override the static `worker_init()` method:
-
-```python
-    @staticmethod
-    def worker_init():
-        """
-        Initialize resources in each worker process.
-        Returns a dict that gets stored in worker context.
-        """
-        import some_heavy_library
-        model = some_heavy_library.load_model()
-
-        return {
-            "model": model,
-            "success": True  # Required flag
-        }
-```
-
-Then access these resources in `evaluate_sequences()`:
-
-```python
-    def evaluate_sequences(self, sequences: List[str], **kwargs) -> pd.DataFrame:
-        from provada.utils.multiprocess import _worker_local
-
-        # Access worker-local resources
-        ctx = getattr(_worker_local, "ctx", {})
-        model = ctx["model"]
-
-        # Use the model
-        predictions = model.predict(sequences)
-        ...
-```
-
-## Optional: Customizing Constructor
-
-You can add custom initialization arguments to your evaluator's `__init__()`. Just make sure to call the parent constructor:
-
-```python
-    def __init__(
-        self,
-        seed: int = 42,
-        active_scores: List[str] = None,
-        use_cache: bool = True,
-        my_custom_param: float = 1.0  # Your custom parameter
-    ):
-        super().__init__(seed=seed, active_scores=active_scores, use_cache=use_cache)
-        self.my_custom_param = my_custom_param
-```
-
-Then you can pass this parameter in your YAML config via the evaluator kwargs (see Configuration section below).
-
-## Using Your Evaluator
-
-Once you've created your evaluator, use it in your configuration by specifying the score in `score_weights`:
-
-```yaml
-sampler:
-  score_weights:
-    my_score_name: 1.0  # ProVADA will automatically find and use your evaluator
-```
-
-ProVADA will automatically:
-- Discover that `my_score_name` is provided by your `MyCustomEvaluator`
-- Instantiate the evaluator with caching enabled
-- Call it during the sampling loop to score sequences
-- Cache results to avoid redundant computation
-
-## Built-in Evaluators
-
-ProVADA includes several evaluators you can use as references or extend:
-
-- **`Dummy`** (`dummy`) - Simple example that counts methionines; great starting point
-- **`SequenceSimilarity`** (`sequence_similarity`) - Computes metrics like hamming distance, identity, etc.
-- **`LocalizationPredictor`** (`localization_predictor`) - Predicts protein localization using ESM2 embeddings
-- **`DiscountedHammingDistance`** (`discounted_hamming_distance`) - Combines multiple evaluators into one
-- **`StructureMetrics`** (`structure`) - Predicts structures with ESM3 and scores with SAP, SASA, Rosetta energy
-
-Browse `provada/components/evaluator.py` to see these implementations.
-
 ## Tips and Best Practices
 
-**Keep scoring fast**: The evaluator will be called many times during a run. If your scoring function is slow, consider batching or using worker processes efficiently.
+**Keep scoring fast**: The evaluator will be called many times during a run. If your scoring function is slow, score a batch per call rather than one sequence at a time.
 
 **Return consistent shapes**: Always return a DataFrame with the same columns (the scores you declared in `available_scores()`).
 

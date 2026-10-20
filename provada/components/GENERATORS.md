@@ -2,6 +2,20 @@
 
 Generators are the creative engine of ProVADA—they take partially masked protein sequences and fill in the masked positions to create new sequence variants. While ProVADA includes generators for ESM3 and ProteinMPNN, you can create your own generator to leverage different models, sampling strategies, or design approaches.
 
+## Built-in Generators
+
+ProVADA includes several generators you can use as references:
+
+- **`ESM3Generator`** (`esm3`) and **`ESM2Generator`** (`esm2`) - Fill masked positions with a protein language model
+- **`MPNNGenerator`** (`mpnn`) - ProteinMPNN for structure-conditioned design, through the JAX toolkit
+- **`SolubleMPNNGenerator`** (`soluble_mpnn`) - ProteinMPNN with the soluble-protein weights
+- **`AbMPNNGenerator`** (`abmpnn`) - ProteinMPNN with the antibody weights
+- **`MPNNPytorchGenerator`** (`mpnn_pytorch`) and **`SolubleMPNNPytorchGenerator`** (`soluble_mpnn_pytorch`) - The same weights through the PyTorch toolkit, which conditions on the whole prompt rather than only the fixed positions, so it does not produce the same designs
+- **`CalibyGenerator`** (`caliby`) and **`SolubleCalibyGenerator`** (`soluble_caliby`) - Caliby's Potts model, which can condition on a conformer ensemble
+- **`RandomGenerator`** (`random`) - Randomly samples amino acids based on codon schemes
+
+Check out `provada/components/generator.py` to see their full implementations.
+
 ## Understanding Generators
 
 A generator receives "prompts" (sequences with masked positions represented as `_` characters) and returns complete sequences where the masked positions have been filled in. The generator is called repeatedly during the sampling loop, creating diverse sequence variants that are then evaluated and selected based on their scores. Generators handle the core sequence design logic while ProVADA manages the iteration, selection, and optimization process.
@@ -66,6 +80,14 @@ The key points:
 - **Output**: Each dict must have `"sequence"` (the filled-in sequence) and `"prompt"` (the original)
 - You can add extra metadata to the output dicts (e.g., model scores, confidence values)
 
+The base `generate()` wrapper requires exactly one output row per input prompt,
+in the same order, with a `sequence` column. It resets input and output indices,
+preserves input-only metadata, and lets generated columns replace input columns
+with the same names. Repeated or nonconsecutive input row labels are supported;
+column names must be unique. Empty inputs return an empty result without calling
+the backend. A custom generator returning several designs per prompt must override
+`generate()` to expand parent metadata explicitly, as ProteinMPNN and Caliby do.
+
 ### Step 3: Add Custom Parameters (Optional)
 
 You'll typically want to initialize your generator with parameters like model paths, temperature, etc. Add these via the constructor:
@@ -119,27 +141,26 @@ Your generator should:
 2. Fill them with amino acids according to your generation strategy
 3. Keep all other positions unchanged (unless you have a specific reason to modify them)
 
-## Built-in Generators
-
-ProVADA includes several generators you can use as references:
-
-- **`ESM3Generator`** (`esm3`) - Uses Meta's ESM3 protein language model for iterative sequence design
-- **`MPNNGenerator`** (`mpnn`) - Uses ProteinMPNN for structure-conditioned design
-- **`SolubleMPNNGenerator`** (`soluble_mpnn`) - ProteinMPNN variant fine-tuned for solubility
-- **`RandomGenerator`** (`random`) - Randomly samples amino acids based on codon schemes
-
-Check out `provada/components/generator.py` to see their full implementations.
-
 ## Using Your Generator
 
-Once you've created your generator, specify it in your YAML configuration:
+Your generator also needs a config variant in `provada/config.py`, declaring
+the parameters `_generate()` accepts:
+
+```python
+class MyCustomGeneratorConfig(GeneratorVariant):
+    """One-line description of what this generator does."""
+
+    generator_type: Literal["my_custom_generator"] = "my_custom_generator"
+    temperature: float = Field(default=0.8, gt=0.0)
+```
+
+Add it to the `GeneratorConfig` union so the discriminator can select it, then
+specify it in your YAML configuration:
 
 ```yaml
 generator:
   generator_type: my_custom_generator
-  generation_kwargs:
-    temperature: 0.8
-    # Any other parameters your generator accepts
+  temperature: 0.8
 ```
 
 ProVADA will:
@@ -172,8 +193,7 @@ Then configure it with:
 ```yaml
 generator:
   generator_type: my_custom_generator
-  generation_kwargs:
-    generations_per_prompt: 10
+  generations_per_prompt: 10
 ```
 
 ## Advanced: Batched Generation
@@ -220,17 +240,17 @@ class HydrophobicRandomGenerator(Generator):
     HYDROPHOBIC_AAS = ['A', 'V', 'I', 'L', 'M', 'F', 'W', 'P']
     HYDROPHILIC_AAS = ['S', 'T', 'N', 'Q', 'C', 'Y', 'K', 'R', 'H', 'D', 'E', 'G']
 
-    def __init__(self, seed: int = 42, hydrophobic_bias: float = 0.7):
+    def __init__(self, seed: int = 42):
         """
         Args:
             seed: Random seed
-            hydrophobic_bias: Probability of sampling a hydrophobic AA (0-1)
         """
         self.seed = seed
-        self.hydrophobic_bias = hydrophobic_bias
         random.seed(seed)
 
-    def _generate(self, prompts: List[str], **kwargs) -> List[dict]:
+    def _generate(
+        self, prompts: List[str], hydrophobic_bias: float = 0.7, **kwargs
+    ) -> List[dict]:
         generations = []
 
         for prompt in prompts:
@@ -240,7 +260,7 @@ class HydrophobicRandomGenerator(Generator):
             # Fill each masked position
             for i, char in enumerate(seq_list):
                 if char == '_':
-                    if random.random() < self.hydrophobic_bias:
+                    if random.random() < hydrophobic_bias:
                         seq_list[i] = random.choice(self.HYDROPHOBIC_AAS)
                     else:
                         seq_list[i] = random.choice(self.HYDROPHILIC_AAS)
@@ -255,13 +275,22 @@ class HydrophobicRandomGenerator(Generator):
         return generations
 ```
 
-Use it in your config:
+Declare its config variant in `provada/config.py`:
+
+```python
+class HydrophobicRandomGeneratorConfig(GeneratorVariant):
+    """Random infilling biased toward hydrophobic residues."""
+
+    generator_type: Literal["hydrophobic_random"] = "hydrophobic_random"
+    hydrophobic_bias: float = Field(default=0.7, ge=0.0, le=1.0)
+```
+
+add it to the `GeneratorConfig` union, then use it in your config:
 
 ```yaml
 generator:
   generator_type: hydrophobic_random
-  generation_kwargs:
-    hydrophobic_bias: 0.8
+  hydrophobic_bias: 0.8
 ```
 
 ## Tips and Best Practices

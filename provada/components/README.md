@@ -8,7 +8,7 @@ The ProVADA framework uses three main component types that work together during 
 
 ```
 ┌─────────────────┐
-│ Masking Strategy│  Decides which positions to redesign
+│    Masking      │  Masks a fraction of the designable positions
 └────────┬────────┘
          │
          ▼
@@ -22,7 +22,10 @@ The ProVADA framework uses three main component types that work together during 
 └─────────────────┘
 ```
 
-Each component type is modular and extensible—you can mix and match built-in components or create your own to implement novel design strategies.
+Masking is not a component: the sampler masks a random fraction of the
+designable positions each iteration, and the fraction comes from the masking
+schedule. Generators and evaluators are both modular and extensible—you can mix
+and match the built-ins or create your own.
 
 ## Component Types
 
@@ -37,7 +40,11 @@ Each component type is modular and extensible—you can mix and match built-in c
 Built-in evaluators include:
 - `sequence_similarity` - Hamming distance, identity, and other sequence metrics
 - `localization_predictor` - Subcellular localization prediction using ESM2
-- `structure` - Structure prediction and quality metrics (SAP, SASA, Rosetta energy)
+- `structure` - ESMFold2 structure prediction, with SAP and Rosetta energy
+- `Immunogenicity` - Predicted MHC class I presentation from netMHCpan
+- `mpnn_score` and `caliby_energy_score` - The generator's own score, carried through
+- `discounted_hamming_distance` - Distance to the reference discounted by localization probability
+- `dummy` - Counts methionines; the smallest worked example of an evaluator
 
 ### 2. Generators
 
@@ -48,23 +55,11 @@ Built-in evaluators include:
 **Learn more**: [GENERATORS.md](./GENERATORS.md)
 
 Built-in generators include:
-- `esm3` - ESM3 protein language model for iterative design
-- `mpnn` - ProteinMPNN for structure-conditioned design
-- `soluble_mpnn` - ProteinMPNN variant optimized for solubility
+- `esm2` and `esm3` - Protein language models for masked infilling
+- `mpnn`, `soluble_mpnn` and `abmpnn` - ProteinMPNN weight sets, through the JAX toolkit
+- `mpnn_pytorch` and `soluble_mpnn_pytorch` - The same weights through the PyTorch toolkit
+- `caliby` and `soluble_caliby` - Caliby's Potts model, optionally ensemble-conditioned
 - `random` - Random amino acid sampling (baseline)
-
-### 3. Masking Strategies
-
-**What they do**: Decide which positions in the sequence to redesign at each iteration based on learned statistics
-
-**When to customize**: When you want to implement different exploration-exploitation trade-offs or incorporate structural/functional constraints into position selection
-
-**Learn more**: [MASKING.md](./MASKING.md)
-
-Built-in strategies include:
-- `random` - Random position selection (baseline)
-- `ducb` - Discounted Upper Confidence Bound for non-stationary rewards
-- `gaussian_thompson` - Thompson sampling with Gaussian reward models
 
 ## Quick Start: Using Built-in Components
 
@@ -74,21 +69,19 @@ To use built-in components, simply specify them in your YAML configuration:
 # Configure the generator
 generator:
   generator_type: esm3
-  generation_kwargs:
-    temperature: 0.7
+  temperature: 0.7
 
 # Configure evaluators via score weights
 sampler:
   score_weights:
-    hamming_distance: -1.0          # Minimize distance from reference
-    predicted_mitochondria: 1.0     # Maximize mitochondrial localization
+    normalized_hamming_distance: 1.0   # Distance from the reference sequence
+    localization_prob: 2.0             # Predicted localization
 
-# Configure the masking strategy
-masking_strategy:
-  masking_strategy_type: ducb
-  masking_strategy_kwargs:
-    gamma: 0.95
-    zeta: 1.0
+# Configure how much of the sequence is redesigned each iteration
+masking_schedule:
+  schedule_type: linear
+  start_value: 0.2
+  stop_value: 0.05
 ```
 
 ProVADA will automatically discover and instantiate the appropriate components.
@@ -119,15 +112,6 @@ class MyGenerator(Generator):
         return [{"sequence": filled_seq, "prompt": prompt} for ...]
 ```
 
-**Masking Strategies**: Implement `_create_masked_sequences()`
-```python
-@MASK_STRATEGY_REGISTRY.register("my_masking")
-class MyMaskingStrategy(MaskingStrategy):
-    def _create_masked_sequences(self, sequences, num_masked_sites):
-        # Your position selection logic
-        return [masked_seq for ...]
-```
-
 ## Component Registration
 
 All components use registry-based discovery. When you register a component with a decorator:
@@ -147,10 +131,8 @@ provada/components/
 ├── README.md                    # This file
 ├── evaluator.py                 # Evaluator base class + built-ins
 ├── generator.py                 # Generator base class + built-ins
-├── masking.py                   # Masking strategy base class + built-ins
 ├── EVALUATORS.md               # Detailed evaluator documentation
-├── GENERATORS.md               # Detailed generator documentation
-└── MASKING.md                  # Detailed masking documentation
+└── GENERATORS.md               # Detailed generator documentation
 ```
 
 ## Common Patterns
@@ -165,25 +147,6 @@ def get_extra_kwargs(self, base_variant):
         "reference_sequence": base_variant.sequence,
         "structure": base_variant.structure
     }
-```
-
-### Worker Process Initialization
-
-For components that use heavy models or libraries, initialize them once per worker process:
-
-```python
-@staticmethod
-def worker_init():
-    model = load_heavy_model()
-    return {"model": model, "success": True}
-```
-
-Then access in your component methods:
-
-```python
-from provada.utils.multiprocess import _worker_local
-ctx = getattr(_worker_local, "ctx", {})
-model = ctx["model"]
 ```
 
 ### Caching
@@ -209,11 +172,6 @@ generator = MyGenerator()
 prompts = ["MK__YI_KQR"]
 results = generator.generate(prompts)
 print(results)
-
-# Test a masking strategy
-strategy = MyMaskingStrategy(sequence_length=10)
-masked = strategy.create_masked_sequences(["MKTAYIAKQR"], num_masked_sites=3)
-print(masked)
 ```
 
 ## Getting Help
@@ -221,6 +179,5 @@ print(masked)
 For detailed information on implementing each component type, see:
 - [EVALUATORS.md](./EVALUATORS.md) - Complete guide to custom scoring functions
 - [GENERATORS.md](./GENERATORS.md) - Complete guide to custom sequence generators
-- [MASKING.md](./MASKING.md) - Complete guide to custom masking strategies
 
-For examples, check the built-in implementations in `evaluator.py`, `generator.py`, and `masking.py`.
+For examples, check the built-in implementations in `evaluator.py` and `generator.py`.

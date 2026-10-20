@@ -12,6 +12,7 @@ from pathlib import Path
 
 from provada.sampler.sampler import SAMPLER_REGISTRY
 from provada.base_variant import BaseVariant
+from provada.config import PowerScheduleConfig
 from provada.utils.setup import init_wandb
 
 
@@ -37,21 +38,16 @@ def test_reference_ranges_only_evaluates_needed_scores():
         },
         "generator_type": "random",
         "generation_kwargs": {"codon_scheme": "NNK"},
-        "temperature_schedule_config": {
-            "type": "power",
-            "kwargs": {"alpha": 3.0, "start_value": 5.0, "stop_value": 0.1},
-        },
+        "temperature_schedule_config": PowerScheduleConfig(
+            alpha=3.0, start_value=5.0, stop_value=0.1
+        ),
         "seed": 42,
-        "device": "cpu",
         "run_name": "test_reference_ranges_optimization",
         "output_dir": tempfile.mkdtemp(),
         "sampler_name": "rejection",
-        "masking_strategy_type": "gaussian_thompson",
-        "masking_strategy_kwargs": {"alpha": 2.0, "gamma": 0.95},
-        "masking_schedule_config": {
-            "type": "power",
-            "kwargs": {"start_value": 0.2, "stop_value": 0.05, "alpha": 2.0},
-        },
+        "masking_schedule_config": PowerScheduleConfig(
+            start_value=0.2, stop_value=0.05, alpha=2.0
+        ),
     }
 
     try:
@@ -91,11 +87,12 @@ def test_reference_ranges_only_evaluates_needed_scores():
         # Initialize evaluators and generator (needed for the test)
         from provada.sampler.startup import StartupMixin
 
+        # Generator first, as the sampler itself does: initialize_evaluators
+        # scores the base variant and asks the generator for its own scores.
+        StartupMixin.initialize_generator(sampler, "random", {"codon_scheme": "NNK"})
+
         sampler.evaluators = []
         StartupMixin.initialize_evaluators(sampler)
-
-        # Initialize generator (needed for reference distribution generation)
-        StartupMixin.initialize_generator(sampler, "random", {"codon_scheme": "NNK"})
 
         # Now manually set the ranges we want to test
         # dummy_score: ranges unspecified (None) - should need evaluation
@@ -115,6 +112,11 @@ def test_reference_ranges_only_evaluates_needed_scores():
         assert sampler.active_scores_dict["dummy_score"]["max_value"] is not None
         assert isinstance(sampler.active_scores_dict["dummy_score"]["min_value"], (int, float))
         assert isinstance(sampler.active_scores_dict["dummy_score"]["max_value"], (int, float))
+        assert (
+            sampler.active_scores_dict["dummy_score"]["max_value"]
+            > sampler.active_scores_dict["dummy_score"]["min_value"]
+        )
+        assert 0.0 <= sampler.base_variant.normalized_score_dict["dummy_score"] <= 1.0
 
         # Verify that sequence_similarity kept its specified ranges
         assert sampler.active_scores_dict["sequence_similarity"]["min_value"] == 0.0
@@ -157,21 +159,16 @@ def test_no_reference_distribution_when_all_ranges_specified():
         },
         "generator_type": "random",
         "generation_kwargs": {"codon_scheme": "NNK"},
-        "temperature_schedule_config": {
-            "type": "power",
-            "kwargs": {"alpha": 3.0, "start_value": 5.0, "stop_value": 0.1},
-        },
+        "temperature_schedule_config": PowerScheduleConfig(
+            alpha=3.0, start_value=5.0, stop_value=0.1
+        ),
         "seed": 42,
-        "device": "cpu",
         "run_name": "test_no_reference_distribution",
         "output_dir": tempfile.mkdtemp(),
         "sampler_name": "rejection",
-        "masking_strategy_type": "gaussian_thompson",
-        "masking_strategy_kwargs": {"alpha": 2.0, "gamma": 0.95},
-        "masking_schedule_config": {
-            "type": "power",
-            "kwargs": {"start_value": 0.2, "stop_value": 0.05, "alpha": 2.0},
-        },
+        "masking_schedule_config": PowerScheduleConfig(
+            start_value=0.2, stop_value=0.05, alpha=2.0
+        ),
     }
 
     try:
@@ -208,11 +205,11 @@ def test_no_reference_distribution_when_all_ranges_specified():
         # Initialize evaluators and generator (needed for the test)
         from provada.sampler.startup import StartupMixin
 
+        # Generator first, as the sampler itself does.
+        StartupMixin.initialize_generator(sampler, "random", {"codon_scheme": "NNK"})
+
         sampler.evaluators = []
         StartupMixin.initialize_evaluators(sampler)
-
-        # Initialize generator (needed for reference distribution generation if it were to run)
-        StartupMixin.initialize_generator(sampler, "random", {"codon_scheme": "NNK"})
 
         # NOW set ALL ranges to specified values (after evaluator initialization)
         sampler.active_scores_dict["dummy_score"]["min_value"] = -10.0
@@ -259,21 +256,16 @@ def test_evaluate_variants_subset():
         },
         "generator_type": "random",
         "generation_kwargs": {"codon_scheme": "NNK"},
-        "temperature_schedule_config": {
-            "type": "power",
-            "kwargs": {"alpha": 3.0, "start_value": 5.0, "stop_value": 0.1},
-        },
+        "temperature_schedule_config": PowerScheduleConfig(
+            alpha=3.0, start_value=5.0, stop_value=0.1
+        ),
         "seed": 42,
-        "device": "cpu",
         "run_name": "test_evaluate_variants_subset",
         "output_dir": tempfile.mkdtemp(),
         "sampler_name": "rejection",
-        "masking_strategy_type": "gaussian_thompson",
-        "masking_strategy_kwargs": {"alpha": 2.0, "gamma": 0.95},
-        "masking_schedule_config": {
-            "type": "power",
-            "kwargs": {"start_value": 0.2, "stop_value": 0.05, "alpha": 2.0},
-        },
+        "masking_schedule_config": PowerScheduleConfig(
+            start_value=0.2, stop_value=0.05, alpha=2.0
+        ),
     }
 
     try:
@@ -299,12 +291,9 @@ def test_evaluate_variants_subset():
             score_weights=test_config["score_weights"],
             generator_type=test_config["generator_type"],
             generation_kwargs=test_config["generation_kwargs"],
-            masking_strategy_type=test_config["masking_strategy_type"],
-            masking_strategy_kwargs=test_config["masking_strategy_kwargs"],
             masking_schedule_config=test_config["masking_schedule_config"],
             temperature_schedule_config=test_config["temperature_schedule_config"],
             seed=test_config["seed"],
-            device=test_config["device"],
             run_name=test_config["run_name"],
             output_dir=test_config["output_dir"],
             wandb_run=wandb_run,
